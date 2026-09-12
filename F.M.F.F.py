@@ -20,6 +20,18 @@ fetch one tile via an HTTP Range request without touching the rest of
 the file. This part is genuinely FMFF's own codec, not a wrapper around
 anything.
 
+A still image's tile index can also hold one or more named *versions*
+(original/retouched/... -- see FMFFEncoder.add_version) alongside the
+base image: each version (layer LAYER_VERSION instead of LAYER_FULL)
+stores only the tiles that changed relative to the version before it,
+sharing the base image's tile grid and quality -- the same "unchanged
+gets no entry at all" trick encode_image_sequence already uses for an
+animation frame, applied to a version chain instead of a time axis.
+This needed no header/entry format change at all -- a reader that only
+ever looks for LAYER_FULL/LAYER_THUMB entries (any reader before this
+existed included) just never sees them, and still decodes the base
+image exactly as before. See README's "Versions" section.
+
 Container layout for a video (frame_count set, is_video true):
     [fixed header]  [thumbnail entry]  [segment table]  [thumbnail payload]
     [media blob: init segment][segment 0][segment 1]...
@@ -181,8 +193,35 @@ VERSION = 13
 # coarse-grained enough that the fragment/keyframe overhead stays small.
 VIDEO_SEGMENT_SECONDS = 4
 
+# Every this-manyth version stores every tile in full, not just the ones
+# that changed (see FMFFEncoder.add_version) -- the same "periodic
+# checkpoint" idea video's own I-frames use, and for the same reason:
+# without it, decoding version N always means replaying every version
+# 1..N in order (see FMFFDecoder.full()), which grows without bound as
+# a version chain gets longer. A periodic full version gives full() (and
+# add_version's own change-comparison) a nearby restart point instead,
+# bounding replay depth to at most this many versions regardless of how
+# long the whole chain gets -- at the cost of one full version's worth
+# of extra storage every this-many versions, not a full copy every
+# version. 8 mirrors this file's other periodic-checkpoint tuning
+# (VIDEO_SEGMENT_SECONDS above): frequent enough that replay depth never
+# grows large, coarse enough that the extra storage stays a small
+# fraction of the whole chain.
+VERSION_SNAPSHOT_INTERVAL = 8
+
 PLANE_COLOR = 0
 PLANE_ALPHA = 1
+# A single-channel, 8-bit-per-pixel plane attached to one version of a
+# still image (see FMFFEncoder.add_mask) -- a selection mask, or any
+# other per-pixel annotation a caller wants back out unchanged. Encoded
+# exactly like PLANE_ALPHA (same lossless tile codec, never raced against
+# the lossy DCT path -- see _decode_entry), but never composited as
+# transparency: full()/full_sequence() never look for it, so it has no
+# effect on how the image itself decodes; only FMFFDecoder.extract_mask
+# reads it. Unlike a color/alpha tile, a mask plane is never inherited
+# across the version chain (see add_mask's own docstring for why) -- it
+# belongs to exactly the (layer, frame) it was stored under.
+PLANE_MASK = 2
 
 MODE_LOSSLESS = 0
 MODE_LOSSY = 1
@@ -220,6 +259,24 @@ CONTENT_DOCUMENT = 4
 
 LAYER_THUMB = 0
 LAYER_FULL = 1
+# A named "version" of the same still image (original/retouched/... --
+# see FMFFEncoder.add_version), sharing the base image's tile grid and
+# quality but storing only the tiles that changed relative to the
+# version before it -- not a full second copy (see add_version's own
+# docstring for why: the same "unchanged gets no entry" saving
+# encode_image_sequence already gives an animation frame, here applied
+# to a version chain). Entry.frame doubles as the version index here
+# (1, 2, ... -- 0 is always the LAYER_FULL tiles already in every
+# still-image .fmff, never stored as a LAYER_VERSION entry itself), the
+# same way it's an animation frame index for LAYER_FULL entries -- the
+# two meanings never collide since versions are only ever added to a
+# non-animated file (see add_version). Existing code that only ever
+# looked for LAYER_FULL/LAYER_THUMB (full(), full_sequence(),
+# thumbnail(), tile_byte_ranges()'s default) ignores LAYER_VERSION
+# entries completely, so a file with extra
+# versions still opens and decodes to exactly its base image in any reader
+# that predates this.
+LAYER_VERSION = 2
 
 # fmt: off
 HEADER_FMT = ("<4sHIIBBBHHHBBBIIIHHIIIIBII"
@@ -265,6 +322,8 @@ ENTRY_FMT = "<IBHHBBHHIII"
 # but literal pixel (x, y) for an animated file's -- an animated file has
 # no fixed tile grid at all, each changed frame stores one rectangle
 # sized to its own change (see encode_image_sequence / full_sequence).
+# A LAYER_VERSION entry always uses tile-grid coordinates, the same as
+# LAYER_FULL's still-image case -- see LAYER_VERSION's own comment.
 ENTRY_SIZE = struct.calcsize(ENTRY_FMT)
 
 FRAME_FMT = "<III"
@@ -1007,21 +1066,33 @@ def _race_color_candidates(rgb_tile, quality):
     return min(candidates, key=lambda kv: len(kv[1]))
 
 
-def _pack_metadata(tags=None, exif_bytes=None, icc_bytes=None):
+def _now_iso():
+    """UTC timestamp for a version's "added" metadata field (see
+    FMFFEncoder.add_version) -- time.gmtime() alone is enough for this,
+    no extra dependency (datetime) needed for one timestamp string."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _pack_metadata(tags=None, exif_bytes=None, icc_bytes=None, versions=None):
     """The optional trailing metadata blob every encode_* method can
     attach (see HEADER_FMT's metadata_offset/metadata_length comment):
     a small JSON envelope carrying source tags (artist/album/title/...,
     from a container's own tags -- audio and video), a raw EXIF blob
     (a still image, byte-for-byte, not re-derived -- same passthrough
-    philosophy as JPEG's own DCT-coefficient path), and/or a raw ICC
-    color profile (also byte-for-byte -- a profile encodes a specific
+    philosophy as JPEG's own DCT-coefficient path), a raw ICC color
+    profile (also byte-for-byte -- a profile encodes a specific
     color-managed workflow's calibration, not something to regenerate
-    from scratch). Both blobs are base64'd inside the JSON rather than
-    needing their own offset/length pairs; an ICC profile is at most a
-    few KB, same order of size as EXIF, so that overhead stays
-    negligible. Returns b"" when there's nothing to store at all, which
-    callers write as a zero-length section (metadata_offset is still
-    recorded, just with length 0)."""
+    from scratch), and/or a still image's version history: a list of
+    {"index", "name", "note", "added", "size"} dicts, one per LAYER_FULL/
+    LAYER_VERSION version stored in the file (see FMFFEncoder.add_version
+    and FMFFDecoder.list_versions) -- everything but the pixels a version
+    needs to be found and labeled, since that's already carried by the
+    LAYER_VERSION tile entries themselves. Both binary blobs are base64'd
+    inside the JSON rather than needing their own offset/length pairs; an
+    ICC profile is at most a few KB, same order of size as EXIF, so that
+    overhead stays negligible. Returns b"" when there's nothing to store
+    at all, which callers write as a zero-length section (metadata_offset
+    is still recorded, just with length 0)."""
     meta = {}
     if tags:
         meta["tags"] = tags
@@ -1029,6 +1100,8 @@ def _pack_metadata(tags=None, exif_bytes=None, icc_bytes=None):
         meta["exif_b64"] = base64.b64encode(exif_bytes).decode("ascii")
     if icc_bytes:
         meta["icc_b64"] = base64.b64encode(icc_bytes).decode("ascii")
+    if versions:
+        meta["versions"] = versions
     if not meta:
         return b""
     return json.dumps(meta).encode("utf-8")
@@ -1036,21 +1109,23 @@ def _pack_metadata(tags=None, exif_bytes=None, icc_bytes=None):
 
 def _unpack_metadata(blob):
     """Inverse of _pack_metadata -- always returns (tags_dict, exif_bytes,
-    icc_bytes), ({}, None, None) for an empty/absent blob rather than
-    raising, so callers never need to special-case "this file predates
-    metadata" beyond that (which every file before VERSION 13 does, and
-    every file before whichever version added icc_b64 for the ICC
-    profile specifically)."""
+    icc_bytes, versions_list), ({}, None, None, []) for an empty/absent
+    blob rather than raising, so callers never need to special-case "this
+    file predates metadata" beyond that (which every file before VERSION
+    13 does, every file before whichever version added icc_b64 for the
+    ICC profile specifically, and every file before whichever version
+    added "versions" for version history specifically)."""
     if not blob:
-        return {}, None, None
+        return {}, None, None, []
     try:
         meta = json.loads(blob.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
-        return {}, None, None
+        return {}, None, None, []
     tags = meta.get("tags") or {}
     exif_bytes = base64.b64decode(meta["exif_b64"]) if "exif_b64" in meta else None
     icc_bytes = base64.b64decode(meta["icc_b64"]) if "icc_b64" in meta else None
-    return tags, exif_bytes, icc_bytes
+    versions = meta.get("versions") or []
+    return tags, exif_bytes, icc_bytes, versions
 
 
 def _ffmpeg_metadata_args(tags):
@@ -1140,6 +1215,52 @@ def _shutdown_tile_pool():
     if _TILE_POOL is not None:
         _TILE_POOL.terminate()
         _TILE_POOL = None
+
+
+def _decode_tile_bytes(data, entry, quality):
+    """The actual dequant/IDCT/lossless dispatch for one tile's already-
+    read-and-CRC-checked bytes -- shared by FMFFDecoder._decode_entry
+    (single-process) and _decode_tile_task (the pooled-decode worker
+    below) so both go through exactly the same logic regardless of which
+    process ends up running it."""
+    if entry.plane in (PLANE_ALPHA, PLANE_MASK):
+        return lossless_decode(data, 1, entry.h, entry.w)[0]
+    if entry.mode == MODE_LOSSY:
+        return lossy_decode(data, entry.h, entry.w, quality)
+    if entry.mode == MODE_PALETTE:
+        return _palette_decode(data, entry.h, entry.w)
+    return lossless_decode(data, 3, entry.h, entry.w).transpose(1, 2, 0)
+
+
+def _decode_tile_task(args):
+    """One tile's worth of decode work: read its bytes directly from the
+    file at its own (offset, length), then decode them. Runs identically
+    whether called directly (small images) or inside a worker process
+    via the tile pool (large images), mirroring _encode_tile_task's own
+    directly-callable-or-pooled design -- decoding was single-process-
+    only until profiling a real ~12MP photo showed full() taking 1.6s+
+    entirely on one core while encode_image's own tile race already had
+    a multi-core pool sitting right there; spreading independent tiles'
+    decode across it the same way cut that to well under half a second
+    once the pool is warm (see FMFFDecoder.full()).
+
+    Never raises: a corrupt/short read or a decode failure both come
+    back as (entry, None) rather than an exception, since a single bad
+    tile crossing a multiprocessing.Pool.map() call as an exception
+    would abort the *whole* batch instead of degrading just that one
+    tile -- the caller (full()) substitutes the usual gray placeholder
+    and counts it exactly like CorruptTileError already does for the
+    single-process path (FMFFDecoder._decode_entry)."""
+    path, entry, quality = args
+    try:
+        with open(path, "rb") as f:
+            f.seek(entry.offset)
+            data = f.read(entry.length)
+        if len(data) != entry.length or (zlib.crc32(data) & 0xFFFFFFFF) != entry.crc32:
+            return entry, None
+        return entry, _decode_tile_bytes(data, entry, quality)
+    except (zlib.error, OSError, ValueError):
+        return entry, None
 
 
 # ---------------------------------------------------- multi-region diffing
@@ -1602,7 +1723,13 @@ class FMFFEncoder:
         self.thumb_max = thumb_max
         self.last_video_backend = None
 
-    def encode(self, input_path, output_path):
+    def encode(self, input_path, output_path, version_name=None, version_note=None):
+        # version_name/version_note only ever apply to the encode_image
+        # (plain still) path below -- silently unused for every other
+        # branch here, the same way e.g. --tile-size is a no-op for a
+        # video/audio source: an animated/JPEG-passthrough/document file
+        # doesn't have FMFF's own per-tile addressing for a second version
+        # to attach to in the first place (see add_version).
         ext = Path(input_path).suffix.lower()
         if ext in (".jpg", ".jpeg"):
             try:
@@ -1627,7 +1754,7 @@ class FMFFEncoder:
                 frames.append(img.convert("RGBA" if has_alpha else "RGB"))
                 durations.append(max(20, img.info.get("duration", 100)))
             return self.encode_image_sequence(frames, durations, output_path)
-        return self.encode_image(img, output_path)
+        return self.encode_image(img, output_path, version_name=version_name, version_note=version_note)
 
     def encode_document(self, input_path, output_path):
         """Store a PDF/.txt as itself -- the original bytes, not a picture
@@ -1845,7 +1972,7 @@ class FMFFEncoder:
                 "tiles": 0, "size": running, "mode": "jpeg-passthrough",
                 "recompressed": recompressed_won}
 
-    def encode_image(self, img, output_path):
+    def encode_image(self, img, output_path, version_name=None, version_note=None):
         # Grabbed before convert() below: Pillow's convert() doesn't carry
         # the source's .info dict over to the new Image object, so this is
         # the only chance to reach the source's raw EXIF bytes (byte-for-
@@ -1904,7 +2031,23 @@ class FMFFEncoder:
             e.offset = running
             running += e.length
 
-        metadata_blob = _pack_metadata(None, exif_bytes, icc_bytes)
+        # Only recorded at all when the caller actually named/noted this
+        # version -- an encode with neither writes exactly the same
+        # metadata blob (and file bytes) as before this existed, so a
+        # plain `encode` with no --version-name/--version-note is a
+        # complete no-op for this feature (see _pack_metadata/
+        # FMFFDecoder.list_versions, which fall back to "original" for an
+        # unnamed version 0).
+        versions_meta = None
+        if version_name or version_note:
+            versions_meta = [{
+                "index": 0,
+                "name": version_name or "original",
+                "note": version_note or "",
+                "added": _now_iso(),
+                "size": sum(e.length for e in entries if e.layer == LAYER_FULL),
+            }]
+        metadata_blob = _pack_metadata(None, exif_bytes, icc_bytes, versions_meta)
         metadata_offset = running
         running += len(metadata_blob)
 
@@ -1934,6 +2077,396 @@ class FMFFEncoder:
             "width": width, "height": height, "has_alpha": has_alpha,
             "tiles": tiles_x * tiles_y, "size": running, "mode": "tile-codec",
         }
+
+    def add_version(self, fmff_path, input_path, name=None, note=None):
+        """Append a new named version to an existing still-image .fmff, in
+        place -- e.g. an original photo's file gaining a "retouched"
+        version alongside it, both in the same container.
+
+        Stores only the tiles whose freshly-encoded bytes actually differ
+        from whatever's already the effective encoding at that position
+        (version 0's, or the latest earlier version that touched it) --
+        not a full second copy of the image. This is the same saving
+        encode_image_sequence already gets from an unchanged animation
+        frame ("a frame identical to the previous one gets no entry at
+        all"), applied to a version chain instead of a time axis -- but
+        compared at the *encoded-bytes* level, not raw pixels: a lossy
+        tile's decode is never bit-exact, so comparing this version's
+        source pixels against the previous version's *decoded* (lossy,
+        already-quantized) pixels would flag nearly every tile as
+        "changed" from quantization noise alone, even ones nobody
+        touched. Comparing what this tile would actually encode to
+        against what's already stored has no such false positives (and
+        no false negatives either -- any real difference, however small,
+        changes the encoded bytes and gets stored) at the cost of every
+        tile still being fully encoded to find out either way; the
+        saving is in what gets *written*, not in encode time. A version's
+        tile grid is guaranteed identical to every other version's in the
+        same file (see the width/height check below), so there's no need
+        for _split_changed_regions' region-finding -- comparing the fixed
+        grid's tiles one by one is enough. A version that only touches a
+        corner of the image (crop a watermark, fix a blemish) costs
+        roughly that corner, not the whole picture; a version that
+        encodes identically to its predecessor (e.g. adding a note
+        without changing the picture) costs no tile data at all, just
+        its metadata entry. A whole-image edit (a global color grade)
+        still touches every tile and costs close to a full copy -- this
+        doesn't create savings that aren't there, it just stops charging
+        for the ones that are.
+
+        The trade-off for this: decoding version N means replaying every
+        version between it and the last full-coverage version at or
+        before it (see full()). Left unbounded, that would mean a long,
+        heavily-edited chain costs more and more to decode as it grows --
+        so every VERSION_SNAPSHOT_INTERVAL-th version is stored in full
+        regardless of what actually changed (see is_snapshot below),
+        giving both full() and this method's own change-comparison a
+        nearby restart point instead of always going back to version 0.
+        Replay depth (and the cost of preparing this method's own
+        comparison, see _nearest_full_version) is bounded by that
+        interval, not by how long the chain has grown to -- at the cost
+        of one full version's worth of extra storage every that many
+        versions, not a full copy every version.
+
+        Scoped to CONTENT_IMAGE, non-animated files on purpose (see
+        LAYER_VERSION's own comment and this file's container-layout
+        docstring): video/audio/JPEG-passthrough/a document are already
+        one opaque blob with no per-tile addressing to append a version
+        into cheaply, and an animated image's entries carry literal
+        per-frame pixel rectangles instead of a fixed tile grid, so
+        there's no shared per-version geometry the way a plain still's
+        tile grid gives for free.
+
+        The new version is encoded at the file's own already-stored
+        quality (dec.quality), never self.quality -- a lossy tile's
+        dequantization at decode time uses the single, file-wide
+        `quality` header field (see FMFFDecoder._decode_entry), so a
+        version encoded at a different quality would decode wrong; every
+        version in a file necessarily shares one quality setting.
+
+        Alpha is likewise a whole-file decision, not a per-version one:
+        the header's `has_alpha` flag (set once, from version 0) applies
+        to every version -- a version added to an alpha-less file has
+        its own alpha silently dropped, and one added to an alpha file
+        gets a fully-opaque alpha plane if its own source has none. A
+        per-tile mix of "some versions have alpha data here, some don't"
+        would make "did this tile actually change" ambiguous across a
+        version boundary where alpha appears/disappears, for no real
+        benefit -- a still image's transparency is normally a property
+        of the picture itself, not something one retouch pass alone
+        introduces.
+
+        The new version must match the file's own width/height exactly:
+        versions are meant to be the same picture, retouched/annotated/
+        masked/etc., not an unrelated image that happens to share a
+        file -- and a fixed tile grid has nowhere to put a differently-
+        sized version even if that weren't the intent."""
+        dec = FMFFDecoder(fmff_path)
+        if dec.content_mode != CONTENT_IMAGE:
+            raise ValueError("add_version only supports a still-image .fmff "
+                              "(not video/audio/JPEG-passthrough/a document)")
+        if dec.is_animated:
+            raise ValueError("add_version doesn't support an already-animated .fmff -- "
+                              "its entries have no fixed tile grid for a version to share")
+        if not dec.has_fixed_tile_grid:
+            raise ValueError("this file has no fixed tile grid for a version to share")
+
+        img = Image.open(input_path).convert("RGBA" if dec.has_alpha else "RGB")
+        if img.size != (dec.width, dec.height):
+            raise ValueError(f"version must match the file's own size {dec.width}x{dec.height} "
+                              f"(got {img.size[0]}x{img.size[1]})")
+
+        arr = np.array(img)
+        rgb = arr[:, :, :3]
+        alpha = arr[:, :, 3] if dec.has_alpha else None
+
+        existing_indices = ({0} | {e.frame for e in dec.entries if e.layer == LAYER_VERSION}
+                             | {v["index"] for v in dec.versions_meta if "index" in v})
+        version_index = max(existing_indices) + 1
+
+        # Every existing entry's payload, read once -- reused both to
+        # work out each tile position's currently-effective encoding
+        # (compared against below) and, unchanged, to copy every earlier
+        # version's bytes through into the rewritten file without
+        # re-encoding them.
+        with open(dec.path, "rb") as f:
+            old_payloads = []
+            for e in dec.entries:
+                f.seek(e.offset)
+                old_payloads.append(f.read(e.length))
+
+        # The (mode, payload) currently in effect at every (tile, plane)
+        # position as of version_index - 1: the nearest full-coverage
+        # version at or before it (see _nearest_full_version -- version
+        # 0's tiles always qualify, so this is always safe) covers every
+        # position unconditionally, then each version after it, in order,
+        # overwrites whatever positions it actually touched -- the
+        # entry-level equivalent of what full(version=version_index - 1)
+        # reconstructs pixel-by-pixel, built here from bytes already in
+        # hand instead of decoding an image (see this method's own
+        # docstring for why pixel comparison against a decoded lossy
+        # version isn't safe). Starting from the nearest full version
+        # instead of always version 0 keeps this bounded the same way
+        # full()'s own replay is (see VERSION_SNAPSHOT_INTERVAL) -- a
+        # long version chain doesn't make every later add_version call
+        # slower to prepare.
+        start = dec._nearest_full_version(version_index - 1)
+        base_layer = LAYER_FULL if start == 0 else LAYER_VERSION
+        effective = {}
+        for e, payload in zip(dec.entries, old_payloads):
+            if e.layer == base_layer and e.frame == start:
+                effective[e.tx, e.ty, e.plane] = (e.mode, payload)
+        for v in range(start + 1, version_index):
+            for e, payload in zip(dec.entries, old_payloads):
+                if e.layer == LAYER_VERSION and e.frame == v:
+                    effective[e.tx, e.ty, e.plane] = (e.mode, payload)
+
+        ts, tiles_x, tiles_y = dec.tile_size, dec.tiles_x, dec.tiles_y
+        tile_dims = {}
+        jobs = []
+        for ty in range(tiles_y):
+            y0, y1 = ty * ts, min((ty + 1) * ts, dec.height)
+            for tx in range(tiles_x):
+                x0, x1 = tx * ts, min((tx + 1) * ts, dec.width)
+                tile_dims[tx, ty] = (x1 - x0, y1 - y0)
+                a_tile = alpha[y0:y1, x0:x1] if dec.has_alpha else None
+                jobs.append((version_index, tx, ty, rgb[y0:y1, x0:x1, :], a_tile, dec.quality))
+
+        if len(jobs) >= _MP_TILE_THRESHOLD:
+            results = _get_tile_pool().map(_encode_tile_task, jobs)
+        else:
+            results = [_encode_tile_task(job) for job in jobs]
+
+        # Every tile got fully (re-)encoded above regardless -- there's
+        # no way to know whether it changed enough to matter without
+        # actually racing it through the same lossless/lossy/palette
+        # codec every earlier version already went through. What's
+        # actually saved is what gets *stored*: a tile whose freshly
+        # encoded bytes match the position's current effective encoding
+        # exactly isn't stored again -- decode falls through to the
+        # existing entry the same way an untouched tile position already
+        # does for any other version (see full()).
+        #
+        # Every VERSION_SNAPSHOT_INTERVAL-th version is the one exception:
+        # every one of its tiles is stored regardless of whether it
+        # changed, making it a full-coverage restart point full() and a
+        # later add_version can jump to instead of always replaying back
+        # to version 0 (see _nearest_full_version). This is the only
+        # place that decision gets made -- everything else about a
+        # snapshot version (its metadata, its place in the version list)
+        # is identical to an ordinary version.
+        is_snapshot = version_index % VERSION_SNAPSHOT_INTERVAL == 0
+        new_entries = []
+        for v_idx, tx, ty, mode, payload, alpha_payload in results:
+            w, h = tile_dims[tx, ty]
+            if is_snapshot or effective.get((tx, ty, PLANE_COLOR)) != (mode, payload):
+                new_entries.append(Entry(v_idx, LAYER_VERSION, tx, ty, PLANE_COLOR, mode, w, h, payload))
+            if alpha_payload is not None:
+                if is_snapshot or effective.get((tx, ty, PLANE_ALPHA)) != (MODE_LOSSLESS, alpha_payload):
+                    new_entries.append(Entry(v_idx, LAYER_VERSION, tx, ty, PLANE_ALPHA, MODE_LOSSLESS,
+                                              w, h, alpha_payload))
+
+        all_entries = list(dec.entries) + new_entries
+        all_payloads = old_payloads + [e.payload for e in new_entries]
+
+        versions_meta = [dict(v) for v in dec.versions_meta if "index" in v]
+        if not any(v["index"] == 0 for v in versions_meta):
+            versions_meta.insert(0, {
+                "index": 0, "name": "original", "note": "", "added": "",
+                "size": sum(e.length for e in dec.entries
+                            if e.layer == LAYER_FULL and e.plane != PLANE_MASK),
+            })
+        versions_meta.append({
+            "index": version_index,
+            "name": name or f"version {version_index}",
+            "note": note or "",
+            "added": _now_iso(),
+            "size": sum(e.length for e in new_entries),
+        })
+
+        index_offset = HEADER_SIZE
+        frame_table_offset = index_offset + len(all_entries) * ENTRY_SIZE
+        data_offset = frame_table_offset + len(dec.frame_table) * FRAME_SIZE
+        running = data_offset
+        for e, payload in zip(all_entries, all_payloads):
+            e.offset = running
+            running += len(payload)
+
+        metadata_blob = _pack_metadata(dec.tags or None, dec.exif_bytes, dec.icc_bytes, versions_meta)
+        metadata_offset = running
+        running += len(metadata_blob)
+
+        header = struct.pack(
+            HEADER_FMT, MAGIC, VERSION, dec.width, dec.height, 8,
+            4 if dec.has_alpha else 3, CONTENT_IMAGE, dec.tile_size, dec.tiles_x, dec.tiles_y,
+            1 if dec.has_alpha else 0, dec.quality,
+            0, len(dec.frame_table), 0, len(all_entries),
+            dec.thumb_w, dec.thumb_h, HEADER_SIZE, index_offset, frame_table_offset, data_offset,
+            0, 0, 0,
+            0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0,
+            metadata_offset, len(metadata_blob),
+        )
+
+        # Written to a temp file and swapped in atomically -- add_version
+        # rewrites the whole file (offsets shift once new entries are
+        # inserted into the index), so a crash/interruption mid-write
+        # must not leave fmff_path itself half-overwritten.
+        tmp_path = Path(str(fmff_path) + ".tmp")
+        with open(tmp_path, "wb") as f:
+            f.write(header)
+            for e in all_entries:
+                f.write(e.pack())
+            for t_ms, start, count in dec.frame_table:
+                f.write(struct.pack(FRAME_FMT, t_ms, start, count))
+            for payload in all_payloads:
+                f.write(payload)
+            f.write(metadata_blob)
+        tmp_path.replace(fmff_path)
+
+        return {
+            "version_index": version_index,
+            "name": versions_meta[-1]["name"],
+            "size": versions_meta[-1]["size"],
+            "total_size": running,
+        }
+
+    def add_mask(self, fmff_path, mask_path, version=None):
+        """Attach a selection mask -- or any other single-channel,
+        per-pixel annotation a caller wants back out unchanged -- to one
+        version of an existing still-image .fmff, in place. Stored as a
+        new PLANE_MASK entry under that version's own (layer, frame),
+        sharing the tile grid every color/alpha tile already uses.
+
+        Encoded losslessly (see PLANE_MASK's own comment) -- always
+        lossless_encode, never raced against the lossy DCT path the way
+        a color tile is: a mask's exact edges are the whole point, not
+        something to approximate for a smaller file. This mirrors
+        PLANE_ALPHA's own encoding exactly.
+
+        version=None (the default) targets the file's most recently
+        added version (see list_versions), or version 0 if the file has
+        no add_version'd versions at all -- the version most likely to
+        be "the one this mask goes with" right after add-version and
+        add-mask are run back to back. Calling this again for a version
+        that already has a mask replaces it; every other version's own
+        mask (or lack of one) is untouched.
+
+        Deliberately NOT part of the version chain's delta/overlay
+        mechanism full()'s version path uses for color/alpha (see
+        FMFFDecoder.extract_mask) -- a mask belongs to exactly the
+        version it was attached to, with no inheritance from an earlier
+        version the way an unedited color/alpha tile is inherited. A
+        selection mask drawn for one retouch pass isn't implicitly
+        "still correct" for a later, different retouch, and there'd be
+        no reliable way to tell a deliberately-reused mask from one that
+        was simply never revisited.
+
+        The mask image must match the file's own width/height exactly,
+        for the same reason a new version must (see add_version) -- a
+        fixed tile grid has nowhere to put a differently-sized plane."""
+        dec = FMFFDecoder(fmff_path)
+        if dec.content_mode != CONTENT_IMAGE:
+            raise ValueError("add_mask only supports a still-image .fmff "
+                              "(not video/audio/JPEG-passthrough/a document)")
+        if dec.is_animated:
+            raise ValueError("add_mask doesn't support an already-animated .fmff -- "
+                              "its entries have no fixed tile grid to attach a mask to")
+        if not dec.has_fixed_tile_grid:
+            raise ValueError("this file has no fixed tile grid to attach a mask to")
+
+        versions = dec.list_versions()
+        if version is None:
+            version = versions[-1]["index"] if versions else 0
+        valid = {v["index"] for v in versions}
+        if version not in valid:
+            raise ValueError(f"version {version} not found in {fmff_path} "
+                              f"(available: {sorted(valid)})")
+
+        img = Image.open(mask_path).convert("L")
+        if img.size != (dec.width, dec.height):
+            raise ValueError(f"mask must match the file's own size {dec.width}x{dec.height} "
+                              f"(got {img.size[0]}x{img.size[1]})")
+        mask_arr = np.array(img)
+
+        layer = LAYER_FULL if version == 0 else LAYER_VERSION
+
+        with open(dec.path, "rb") as f:
+            old_payloads = []
+            for e in dec.entries:
+                f.seek(e.offset)
+                old_payloads.append(f.read(e.length))
+
+        # Drop this version's existing mask, if any -- add_mask replaces
+        # rather than stacking. Every other entry (every color/alpha
+        # tile, every other version's own mask) is kept exactly as-is.
+        kept_entries, kept_payloads = [], []
+        for e, payload in zip(dec.entries, old_payloads):
+            if e.layer == layer and e.frame == version and e.plane == PLANE_MASK:
+                continue
+            kept_entries.append(e)
+            kept_payloads.append(payload)
+
+        ts, tiles_x, tiles_y = dec.tile_size, dec.tiles_x, dec.tiles_y
+        new_entries = []
+        for ty in range(tiles_y):
+            y0, y1 = ty * ts, min((ty + 1) * ts, dec.height)
+            for tx in range(tiles_x):
+                x0, x1 = tx * ts, min((tx + 1) * ts, dec.width)
+                tile = mask_arr[y0:y1, x0:x1]
+                payload = lossless_encode(tile[None, :, :])
+                new_entries.append(Entry(version, layer, tx, ty, PLANE_MASK, MODE_LOSSLESS,
+                                          x1 - x0, y1 - y0, payload))
+
+        all_entries = kept_entries + new_entries
+        all_payloads = kept_payloads + [e.payload for e in new_entries]
+
+        # Nothing in the metadata blob needs to change -- has_mask/
+        # mask_size (see list_versions) are derived from the entries
+        # themselves, not recorded redundantly in "versions" metadata.
+        metadata_blob = _pack_metadata(dec.tags or None, dec.exif_bytes, dec.icc_bytes,
+                                        dec.versions_meta or None)
+
+        index_offset = HEADER_SIZE
+        frame_table_offset = index_offset + len(all_entries) * ENTRY_SIZE
+        data_offset = frame_table_offset + len(dec.frame_table) * FRAME_SIZE
+        running = data_offset
+        for e, payload in zip(all_entries, all_payloads):
+            e.offset = running
+            running += len(payload)
+        metadata_offset = running
+        running += len(metadata_blob)
+
+        header = struct.pack(
+            HEADER_FMT, MAGIC, VERSION, dec.width, dec.height, 8,
+            4 if dec.has_alpha else 3, CONTENT_IMAGE, dec.tile_size, dec.tiles_x, dec.tiles_y,
+            1 if dec.has_alpha else 0, dec.quality,
+            0, len(dec.frame_table), 0, len(all_entries),
+            dec.thumb_w, dec.thumb_h, HEADER_SIZE, index_offset, frame_table_offset, data_offset,
+            0, 0, 0,
+            0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0,
+            metadata_offset, len(metadata_blob),
+        )
+
+        # Same atomic swap as add_version -- add_mask also rewrites the
+        # whole file (the index grows/shrinks by this version's mask
+        # entries), so a crash mid-write must not leave fmff_path itself
+        # half-overwritten.
+        tmp_path = Path(str(fmff_path) + ".tmp")
+        with open(tmp_path, "wb") as f:
+            f.write(header)
+            for e in all_entries:
+                f.write(e.pack())
+            for t_ms, start, count in dec.frame_table:
+                f.write(struct.pack(FRAME_FMT, t_ms, start, count))
+            for payload in all_payloads:
+                f.write(payload)
+            f.write(metadata_blob)
+        tmp_path.replace(fmff_path)
+
+        return {"version_index": version, "size": sum(e.length for e in new_entries),
+                "total_size": running}
 
     def encode_image_sequence(self, frames, durations_ms, output_path):
         """Encode a multi-frame source (animated GIF/WebP/APNG) as a single
@@ -2510,10 +3043,10 @@ class FMFFDecoder:
         self.alpha_init_segment_crc32 = alpha_init_segment_crc32
         self.alpha_segment_count = alpha_segment_count
         self.alpha_segment_table_offset = alpha_segment_table_offset
-        # ({}, None, None) for any file predating VERSION 13, or one whose
-        # source simply had no tags/EXIF/ICC profile to carry over -- see
-        # _pack_metadata/_unpack_metadata.
-        self.tags, self.exif_bytes, self.icc_bytes = _unpack_metadata(metadata_raw)
+        # ({}, None, None, []) for any file predating VERSION 13, or one
+        # whose source simply had no tags/EXIF/ICC profile/version history
+        # to carry over -- see _pack_metadata/_unpack_metadata.
+        self.tags, self.exif_bytes, self.icc_bytes, self.versions_meta = _unpack_metadata(metadata_raw)
 
         # A truncated/still-downloading file can cut the index table off
         # mid-entry -- drop only that dangling partial entry rather than
@@ -2543,13 +3076,7 @@ class FMFFDecoder:
     def _decode_entry(self, entry):
         data = self._read(entry)
         try:
-            if entry.plane == PLANE_ALPHA:
-                return lossless_decode(data, 1, entry.h, entry.w)[0]
-            if entry.mode == MODE_LOSSY:
-                return lossy_decode(data, entry.h, entry.w, self.quality)
-            if entry.mode == MODE_PALETTE:
-                return _palette_decode(data, entry.h, entry.w)
-            return lossless_decode(data, 3, entry.h, entry.w).transpose(1, 2, 0)
+            return _decode_tile_bytes(data, entry, self.quality)
         except (zlib.error, OSError, ValueError) as exc:
             # CRC matched but the payload still doesn't decompress/reshape
             # cleanly -- extremely unlikely, but fail the same clean way.
@@ -2579,10 +3106,16 @@ class FMFFDecoder:
         return Image.fromarray(color, "RGB")
 
     def tile_byte_ranges(self, layer=LAYER_FULL):
-        """(offset, length) pairs for every tile payload -- images only.
-        Suitable for HTTP Range requests, so a client can fetch a single
-        tile without touching the rest of the file."""
-        return [(e.offset, e.length) for e in self.entries if e.layer == layer]
+        """(offset, length) pairs for every *image* tile payload (color
+        and alpha, never a PLANE_MASK entry -- see add_mask) at the given
+        layer -- images only. Suitable for HTTP Range requests, so a
+        client can fetch a single tile without touching the rest of the
+        file; also what the viewer's progressive-load tile counter counts
+        against, which must agree with what full() actually blits (see
+        its own PLANE_MASK exclusion) or the counter would never reach
+        its total on a file with a version-0 mask."""
+        return [(e.offset, e.length) for e in self.entries
+                if e.layer == layer and e.plane != PLANE_MASK]
 
     @property
     def is_animated(self):
@@ -2606,7 +3139,106 @@ class FMFFDecoder:
         durations.append(durations[-1])
         return durations
 
-    def full(self, progress_cb=None, frame=0):
+    def list_versions(self):
+        """[{"index", "name", "note", "added", "size", "has_mask",
+        "mask_size"}, ...], sorted by index -- one entry per version that
+        exists, labeled from self.versions_meta where a name/note/
+        timestamp was ever recorded and falling back to a plain default
+        ("original" for 0, "version N" otherwise) where it wasn't. "size"
+        is that version's own *incremental* cost -- the bytes of the
+        color/alpha tiles it actually changed relative to the version
+        before it (see add_version), zero for a version that changed no
+        pixels at all (e.g. one added only to attach a note); mask bytes
+        (see add_mask) are counted separately in "mask_size" rather than
+        folded into "size", since a mask isn't part of the image itself.
+        Version indices come from self.versions_meta (recorded even for
+        a zero-changed-tiles version, which stores no LAYER_VERSION
+        entries at all) unioned with whatever LAYER_VERSION frame numbers
+        actually appear in the index, so neither source missing an index
+        drops it. Always at least one entry (index 0) for a still,
+        non-animated CONTENT_IMAGE file -- every such file has its
+        LAYER_FULL tiles whether or not add_version has ever touched it;
+        empty for any other content type or an animated file, neither of
+        which supports versions (see add_version)."""
+        if self.content_mode != CONTENT_IMAGE or self.is_animated:
+            return []
+        by_index = {v["index"]: v for v in self.versions_meta if "index" in v}
+        indices = ({0} | {e.frame for e in self.entries if e.layer == LAYER_VERSION}
+                   | set(by_index))
+        out = []
+        for idx in sorted(indices):
+            meta = by_index.get(idx, {})
+            layer = LAYER_FULL if idx == 0 else LAYER_VERSION
+            version_entries = [e for e in self.entries if e.layer == layer and e.frame == idx]
+            default_size = sum(e.length for e in version_entries if e.plane != PLANE_MASK)
+            mask_size = sum(e.length for e in version_entries if e.plane == PLANE_MASK)
+            default_name = "original" if idx == 0 else f"version {idx}"
+            out.append({
+                "index": idx,
+                "name": meta.get("name") or default_name,
+                "note": meta.get("note") or "",
+                "added": meta.get("added") or "",
+                "size": meta.get("size", default_size),
+                "has_mask": mask_size > 0,
+                "mask_size": mask_size,
+            })
+        return out
+
+    def extract_mask(self, version=0, progress_cb=None):
+        """Decode the selection mask attached to one version (see
+        FMFFEncoder.add_mask), as a grayscale ("L") Image -- raises
+        ValueError if that version has no mask.
+
+        Unlike full()'s color/alpha reconstruction, this never falls
+        back to an earlier version's mask: a mask belongs to exactly the
+        version it was attached to, with no inheritance across the
+        version chain (see add_mask's own docstring for why)."""
+        if self.content_mode != CONTENT_IMAGE or self.is_animated or not self.has_fixed_tile_grid:
+            raise ValueError(f"{self.path} has no versions/masks to extract from")
+        layer = LAYER_FULL if version == 0 else LAYER_VERSION
+        tile_entries = sorted(
+            (e for e in self.entries if e.layer == layer and e.frame == version
+             and e.plane == PLANE_MASK),
+            key=lambda e: (e.ty, e.tx))
+        if not tile_entries:
+            raise ValueError(f"version {version} has no mask attached (see add-mask)")
+        canvas = np.zeros((self.height, self.width), dtype=np.uint8)
+        ts = self.tile_size
+        for e in tile_entries:
+            y0, x0 = e.ty * ts, e.tx * ts
+            try:
+                decoded = self._decode_entry(e)
+            except CorruptTileError:
+                decoded = _broken_tile_fill(e.h, e.w, 1)
+            canvas[y0:y0 + e.h, x0:x0 + e.w] = decoded
+            if progress_cb:
+                progress_cb(e, y0, x0, decoded)
+        return Image.fromarray(canvas, "L")
+
+    def _nearest_full_version(self, version):
+        """The largest version index <= `version` whose own PLANE_COLOR
+        tiles cover every position in the tile grid -- 0 if none does
+        (version 0's LAYER_FULL tiles always cover the whole grid, so
+        that's always a safe fallback). Shared by full() (to bound how
+        far back a decode has to replay) and add_version (to bound how
+        far back its own change-comparison has to replay) -- see
+        VERSION_SNAPSHOT_INTERVAL for why a later version can also
+        qualify: a periodic full version is deliberately built to cover
+        every tile, but an ordinary delta version that happens to touch
+        every tile qualifies too, just as validly, by construction."""
+        if version <= 0:
+            return 0
+        total_tiles = self.tiles_x * self.tiles_y
+        color_counts = {}
+        for e in self.entries:
+            if e.layer == LAYER_VERSION and e.frame <= version and e.plane == PLANE_COLOR:
+                color_counts[e.frame] = color_counts.get(e.frame, 0) + 1
+        for v in range(version, 0, -1):
+            if color_counts.get(v, 0) == total_tiles:
+                return v
+        return 0
+
+    def full(self, progress_cb=None, frame=0, version=0):
         """Decode one frame of a still image (frame 0 for an ordinary
         single-frame file) -- images only, video has no per-tile data to
         assemble, see extract_media(). Dispatches to the JPEG-passthrough
@@ -2625,35 +3257,110 @@ class FMFFDecoder:
         which this delegates to full_sequence() for. Decoding *every*
         frame of a no-fixed-grid file should call full_sequence()
         directly instead of looping this: each call here would redo that
-        whole 0..N replay from scratch."""
+        whole 0..N replay from scratch.
+
+        `version` (see add_version/list_versions) picks which named
+        version to decode instead of `frame` -- the two never apply to
+        the same file (a version is only ever added to a non-animated
+        file, see add_version), so there's no ambiguity between them.
+        version=0, the default, is the LAYER_FULL tiles every still
+        image already had before this existed -- identical output to
+        calling full() with no arguments at all on any file, versioned
+        or not.
+
+        A version > 0 only ever stores the tiles that changed relative
+        to the version before it (see add_version), so reconstructing it
+        in principle means starting from version 0's full canvas and
+        replaying every version 1..version's own changed tiles on top,
+        in order -- the same "start from a base, overlay each step's
+        changes" shape full_sequence() already uses for animation
+        frames, just keyed by version number instead of frame number.
+        In practice this starts from the *nearest* version at or before
+        `version` that happens to cover every tile (see
+        _nearest_full_version and VERSION_SNAPSHOT_INTERVAL) instead of
+        always version 0, so replay depth stays bounded by how often a
+        full version occurs, not by `version` itself -- decoding version
+        1000 of a long chain doesn't replay 1000 versions, only back to
+        the nearest one that's a full snapshot. Alpha is a whole-file
+        property (see add_version), so alpha_canvas is created once from
+        self.has_alpha and shared across every step, not recomputed per
+        version."""
         if self.is_jpeg_passthrough:
             return self._decode_jpeg_passthrough()
         if not self.has_fixed_tile_grid:
             return self.full_sequence()[frame]
+        if version != 0:
+            valid = {v["index"] for v in self.list_versions()}
+            if version not in valid:
+                raise ValueError(f"version {version} not found in {self.path} "
+                                  f"(available: {sorted(valid)})")
         # Gray, not black, so any region a corrupt/truncated file never
         # covers at all (not just a tile that failed its own CRC) still
         # reads as "missing" rather than looking like real black content.
         canvas = np.full((self.height, self.width, 3), 128, dtype=np.uint8)
         alpha_canvas = np.full((self.height, self.width), 255, dtype=np.uint8) if self.has_alpha else None
         self.last_corrupt_tiles = 0
+        ts = self.tile_size
 
-        tile_entries = sorted((e for e in self.entries if e.layer == LAYER_FULL and e.frame == 0),
-                               key=lambda e: (e.ty, e.tx, e.plane))
-        for e in tile_entries:
-            ts = self.tile_size
-            y0, x0 = e.ty * ts, e.tx * ts
-            try:
-                decoded = self._decode_entry(e)
-            except CorruptTileError:
-                self.last_corrupt_tiles += 1
-                decoded = (_broken_tile_fill(e.h, e.w, 1) if e.plane == PLANE_ALPHA
-                           else _broken_tile_fill(e.h, e.w, 3))
-            if e.plane == PLANE_ALPHA:
-                alpha_canvas[y0:y0 + e.h, x0:x0 + e.w] = decoded
+        def _blit(step_entries):
+            # Large batches (a real photo's worth of tiles) go through
+            # the same multi-core pool encode_image already uses, not a
+            # sequential Python loop -- profiling a real ~12MP photo
+            # showed decoding it took 1.6s+ entirely on one core (see
+            # _decode_tile_task's own docstring), which the viewer feels
+            # as a visible pause between the window opening and the
+            # picture actually appearing. imap_unordered rather than
+            # map(): results stream back as each tile finishes instead
+            # of only after the whole batch does, so progress_cb still
+            # gets called tile-by-tile for the viewer's progressive
+            # reveal -- just in whatever order workers finish them in,
+            # not strictly top-to-bottom anymore.
+            step_entries = sorted(step_entries, key=lambda e: (e.ty, e.tx, e.plane))
+            if not step_entries:
+                return
+            jobs = [(self.path, e, self.quality) for e in step_entries]
+            if len(step_entries) >= _MP_TILE_THRESHOLD:
+                # imap_unordered defaults to chunksize=1 -- one IPC round
+                # trip per tile, unlike map()'s own auto-computed batching
+                # -- which measured dramatically slower here (sending
+                # ~3000 tiles one at a time ate most of the parallel
+                # speedup in IPC overhead). Matching map()'s own rule of
+                # thumb (roughly 4 chunks per worker) instead recovered it.
+                chunksize = max(1, len(jobs) // (8 * 4))
+                results = _get_tile_pool().imap_unordered(_decode_tile_task, jobs, chunksize=chunksize)
             else:
-                canvas[y0:y0 + e.h, x0:x0 + e.w, :] = decoded
-            if progress_cb:
-                progress_cb(e, y0, x0, decoded)
+                results = (_decode_tile_task(job) for job in jobs)
+            for e, decoded in results:
+                y0, x0 = e.ty * ts, e.tx * ts
+                if decoded is None:
+                    self.last_corrupt_tiles += 1
+                    decoded = (_broken_tile_fill(e.h, e.w, 1) if e.plane == PLANE_ALPHA
+                               else _broken_tile_fill(e.h, e.w, 3))
+                if e.plane == PLANE_ALPHA:
+                    alpha_canvas[y0:y0 + e.h, x0:x0 + e.w] = decoded
+                else:
+                    canvas[y0:y0 + e.h, x0:x0 + e.w, :] = decoded
+                if progress_cb:
+                    progress_cb(e, y0, x0, decoded)
+
+        # PLANE_MASK entries (see add_mask) share the same (layer, frame)
+        # bucket as color/alpha but must never be composited into the
+        # image itself -- excluded here, not just left to _blit's own
+        # plane check, since that check only knows "alpha or not".
+        start = self._nearest_full_version(version) if version else 0
+        if start == 0:
+            _blit(e for e in self.entries
+                  if e.layer == LAYER_FULL and e.frame == 0 and e.plane != PLANE_MASK)
+        else:
+            _blit(e for e in self.entries
+                  if e.layer == LAYER_VERSION and e.frame == start and e.plane != PLANE_MASK)
+        if version > start:
+            by_version = {}
+            for e in self.entries:
+                if e.layer == LAYER_VERSION and start < e.frame <= version and e.plane != PLANE_MASK:
+                    by_version.setdefault(e.frame, []).append(e)
+            for v in range(start + 1, version + 1):
+                _blit(by_version.get(v, []))
 
         if alpha_canvas is not None:
             return Image.fromarray(np.dstack([canvas, alpha_canvas]), "RGBA")
@@ -4239,7 +4946,8 @@ def cmd_encode(args):
     else:
         quality = _default_quality_for(args.input, args.quality)
         enc = FMFFEncoder(tile_size=args.tile_size, quality=quality, thumb_max=args.thumb_max)
-        stats = enc.encode(args.input, args.output)
+        stats = enc.encode(args.input, args.output,
+                            version_name=args.version_name, version_note=args.version_note)
         print(f"encoded {args.input} -> {args.output}")
         if stats.get("mode") == "jpeg-passthrough":
             if stats["recompressed"]:
@@ -4277,13 +4985,84 @@ def cmd_encode(args):
             region_note = f"{stats['tiles']} tiles" if "tiles" in stats else "no fixed tile grid"
             print(f"  {stats['width']}x{stats['height']}, alpha={stats['has_alpha']}, "
                   f"{region_note}{frames_note}, quality={quality}")
+            if args.version_name or args.version_note:
+                print(f"  version 0 ({args.version_name or 'original'!r}): "
+                      f"{args.version_note or '(no note)'!r}")
         print(f"  size: {src_size} -> {stats['size']} bytes "
               f"({_fmt_size(src_size)} -> {_fmt_size(stats['size'])}, {_fmt_saving(src_size, stats['size'])})")
+
+
+def cmd_add_version(args):
+    enc = FMFFEncoder()
+    src_size = Path(args.fmff).stat().st_size
+    try:
+        result = enc.add_version(args.fmff, args.input, name=args.name, note=args.note)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+    new_size = Path(args.fmff).stat().st_size
+    print(f"added version {result['version_index']} ({result['name']!r}) to {args.fmff}")
+    print(f"  version size: {_fmt_size(result['size'])}")
+    print(f"  file size: {_fmt_size(src_size)} -> {_fmt_size(new_size)} "
+          f"({_fmt_saving(src_size, new_size)})")
+
+
+def cmd_add_mask(args):
+    enc = FMFFEncoder()
+    src_size = Path(args.fmff).stat().st_size
+    version = None
+    if args.version is not None:
+        version = _resolve_version_arg(args.version, FMFFDecoder(args.fmff).list_versions())
+    try:
+        result = enc.add_mask(args.fmff, args.mask, version=version)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+    new_size = Path(args.fmff).stat().st_size
+    print(f"added mask to version {result['version_index']} of {args.fmff} "
+          f"({_fmt_size(result['size'])})")
+    print(f"  file size: {_fmt_size(src_size)} -> {_fmt_size(new_size)} "
+          f"({_fmt_saving(src_size, new_size)})")
+
+
+def _resolve_version_arg(value, versions):
+    """CLI --version can name a version either by its numeric index or by
+    its --name (see add_version/cmd_add_version) -- this turns whichever
+    was given into the index list_versions()/full(version=...) expect,
+    or raises a clear SystemExit listing what's actually in the file."""
+    available = ", ".join(f"{v['index']}:{v['name']}" for v in versions)
+    try:
+        idx = int(value)
+    except ValueError:
+        matches = [v for v in versions if v["name"] == value]
+        if not matches:
+            raise SystemExit(f"no version named {value!r} -- available: {available}")
+        return matches[0]["index"]
+    if idx not in {v["index"] for v in versions}:
+        raise SystemExit(f"no version {idx} -- available: {available}")
+    return idx
 
 
 def cmd_decode(args):
     dec = FMFFDecoder(args.input)
     out_ext = Path(args.output).suffix.lower()
+
+    if getattr(args, "mask", False):
+        # Still-image-only, and orthogonal to every other content-type
+        # branch below -- resolved and handled up front rather than
+        # threaded through the video/audio/document/animation logic that
+        # follows, none of which a mask has anything to do with.
+        versions = dec.list_versions()
+        if not versions:
+            raise SystemExit("--mask only works on a still-image .fmff (see add-mask)")
+        version_index = (_resolve_version_arg(args.version, versions)
+                          if args.version is not None else versions[-1]["index"])
+        try:
+            mask_img = dec.extract_mask(version=version_index)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+        mask_img.save(args.output)
+        print(f"decoded mask for version {version_index} of {args.input} -> {args.output} "
+              f"({dec.width}x{dec.height})")
+        return
 
     if dec.is_document:
         # No transcoding to do or choose between -- the stored bytes ARE
@@ -4420,7 +5199,18 @@ def cmd_decode(args):
             print(f"  note: {args.input} is animated ({dec.frame_count} frames) but {out_ext} "
                   f"doesn't support animation -- decoding frame 0 only "
                   f"(use .gif/.webp/.png for the full animation)")
-        img = dec.full()
+        # --version picks a specific one by index or --name; with no
+        # --version and more than one version stored, decode defaults to
+        # the most recently added one (version control's usual "give me
+        # the current state" default) rather than silently always meaning
+        # version 0 -- see add_version/list_versions.
+        version_index = 0
+        versions = dec.list_versions()
+        if args.version is not None:
+            version_index = _resolve_version_arg(args.version, versions)
+        elif len(versions) > 1:
+            version_index = versions[-1]["index"]
+        img = dec.full(version=version_index)
         # See the animated branch above for why .webp specifically needs
         # lossless=True: Pillow's WebP writer otherwise defaults to lossy
         # regardless of how exactly FMFF itself decoded the pixels.
@@ -4430,7 +5220,8 @@ def cmd_decode(args):
         if dec.icc_bytes:
             save_kwargs["icc_profile"] = dec.icc_bytes
         img.save(args.output, **save_kwargs)
-        print(f"decoded {args.input} -> {args.output} ({dec.width}x{dec.height})")
+        version_note = f", version {version_index}" if len(versions) > 1 else ""
+        print(f"decoded {args.input} -> {args.output} ({dec.width}x{dec.height}{version_note})")
         if dec.last_corrupt_tiles:
             print(f"  warning: {dec.last_corrupt_tiles} tile(s) failed their CRC32 check "
                   f"and were filled with gray placeholders")
@@ -4506,7 +5297,7 @@ def cmd_open_external(args):
 
     tmp_dir = tempfile.mkdtemp(prefix="fmff_open_")
     out_path = os.path.join(tmp_dir, "content" + out_ext)
-    cmd_decode(argparse.Namespace(input=args.input, output=out_path, alpha_output=None))
+    cmd_decode(argparse.Namespace(input=args.input, output=out_path, alpha_output=None, version=None))
 
     if args.choose:
         if os.name != "nt":
@@ -4676,6 +5467,20 @@ def cmd_info(args):
         print(f"EXIF: {len(dec.exif_bytes)} bytes (camera/GPS/orientation, passed through verbatim)")
     if dec.icc_bytes:
         print(f"ICC profile: {len(dec.icc_bytes)} bytes, passed through verbatim")
+    versions = dec.list_versions()
+    # Only worth a section when there's actually more than the one version
+    # every still image already has, or that lone version was explicitly
+    # named/noted (see FMFFEncoder.encode's --version-name/--version-note)
+    # -- an ordinary unnamed still stays silent about this exactly like it
+    # would have before add_version existed.
+    has_extra_info = any(v["note"] or v["added"] or v["has_mask"] for v in versions)
+    if len(versions) > 1 or has_extra_info:
+        print(f"versions ({len(versions)}):")
+        for v in versions:
+            added = f", added {v['added']}" if v["added"] else ""
+            mask = f", mask {_fmt_size(v['mask_size'])}" if v["has_mask"] else ""
+            note = f" -- {v['note']}" if v["note"] else ""
+            print(f"  [{v['index']}] {v['name']!r}: {_fmt_size(v['size'])}{mask}{added}{note}")
 
 
 def cmd_view(args):
@@ -4710,7 +5515,35 @@ def main():
                           f"{DEFAULT_AUDIO_BITRATE_KBPS}k, auto-lowered for an "
                           f"already-lossy source with a lower bitrate of its own -- "
                           f"see _default_audio_bitrate)")
+    pe.add_argument("--version-name", default=None,
+                     help="still image only: label this file's version 0 (default: 'original' "
+                          "once any version metadata exists -- see add-version)")
+    pe.add_argument("--version-note", default=None,
+                     help="still image only: freeform note for version 0 (see --version-name)")
     pe.set_defaults(func=cmd_encode)
+
+    pav = sub.add_parser("add-version",
+                          help="append a named version (e.g. a retouched copy) of a still image "
+                               "to an existing .fmff, in place -- see README's 'Versions' section")
+    pav.add_argument("fmff", help="existing still-image .fmff to add a version to")
+    pav.add_argument("input", help="image for the new version -- must match the file's own "
+                                    "width/height")
+    pav.add_argument("--name", default=None, help="label for this version (default: 'version N')")
+    pav.add_argument("--note", default=None,
+                      help="freeform note describing this version / what changed")
+    pav.set_defaults(func=cmd_add_version)
+
+    pam = sub.add_parser("add-mask",
+                          help="attach a selection mask (or any single-channel per-pixel "
+                               "annotation) to one version of a still-image .fmff, in place -- "
+                               "see README's 'Selection masks' section")
+    pam.add_argument("fmff", help="existing still-image .fmff to attach a mask to")
+    pam.add_argument("mask", help="grayscale mask image -- must match the file's own "
+                                   "width/height")
+    pam.add_argument("--version", default=None,
+                      help="which version this mask belongs to, by index or --name "
+                           "(default: the most recently added version)")
+    pam.set_defaults(func=cmd_add_mask)
 
     pd = sub.add_parser("decode", help="decode .fmff into a normal image, video, or audio file")
     pd.add_argument("input")
@@ -4718,6 +5551,13 @@ def main():
     pd.add_argument("--alpha-output", metavar="PATH",
                      help="also extract the alpha track (video-with-transparency .fmff only) "
                           "as its own grayscale video file, e.g. for compositing elsewhere")
+    pd.add_argument("--version", default=None,
+                     help="still image only: which version to decode -- an index (0 = original) "
+                          "or a --name from add-version (default: the most recently added "
+                          "version, or plain version 0 if there's only the one)")
+    pd.add_argument("--mask", action="store_true",
+                     help="still image only: decode the selected version's attached mask (see "
+                          "add-mask) instead of the image itself -- errors if it has none")
     pd.set_defaults(func=cmd_decode)
 
     pi = sub.add_parser("info", help="print header/index summary")
@@ -4756,8 +5596,8 @@ def main():
     pu.set_defaults(func=cmd_unregister_filetype)
 
     argv = sys.argv[1:]
-    known_commands = {"encode", "decode", "info", "view", "open-external",
-                       "register-filetype", "unregister-filetype"}
+    known_commands = {"encode", "add-version", "add-mask", "decode", "info", "view",
+                       "open-external", "register-filetype", "unregister-filetype"}
     if not argv:
         # No arguments at all -- a plain double-click of the .exe itself
         # (not via a file association, which always passes a path -- see

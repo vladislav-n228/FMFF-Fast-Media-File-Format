@@ -53,6 +53,24 @@ This part is genuinely FMFF's own format, built around a few ideas:
   threshold), and the pool itself is created once and reused for the
   life of the process, not respawned per file, so batch-converting many
   large images only pays that startup cost once.
+- **Multi-core decoding for large images, too** -- decoding was single-
+  process-only until profiling a real ~12MP photo (a typical phone/
+  camera resolution) showed opening it took 1.6s+ entirely on one core,
+  visible as a real pause in the viewer between the window appearing and
+  the picture actually rendering. Every tile's decode is exactly as
+  independent as its encode, so it now goes through the same pool
+  (`imap_unordered`, so tiles still stream back and reveal progressively
+  in the viewer instead of only appearing all at once when the whole
+  batch finishes). Measured on that same 12MP photo: ~1.2s on a cold
+  pool (the first file opened in a session, paying worker-startup cost),
+  **~0.5s once the pool is warm** (every file after that in the same
+  session) -- a ~3.2x speedup for the common case of opening more than
+  one image without restarting the app. A first attempt using
+  `ThreadPoolExecutor` instead of processes measured *slower* than the
+  original single-threaded code (the GIL isn't released enough during
+  all these small, fast per-tile operations for threads to pay off) --
+  worth knowing if this is revisited, so that mistake doesn't get
+  repeated.
 - **Animation** -- a multi-frame source (animated GIF/WebP/APNG) encodes
   as a single `.fmff` with more than one frame instead of collapsing to
   a still. This isn't a bolted-on addition: the container already had
@@ -168,6 +186,131 @@ This part is genuinely FMFF's own format, built around a few ideas:
   whole thing this way was 5-6x faster than the naive per-frame loop,
   and the gap widens with more frames since the old path was quadratic
   and this one isn't.
+
+## Versions -- an edit history for one still image, in one file
+
+No mainstream media container (WebP, PNG, MP4, PDF, ...) has a built-in
+way to keep more than one version of the same content in one file with
+small, per-version overhead -- an original photo plus a retouched copy,
+a selection mask, or anything else derived from it either lives as
+separate files or isn't kept at all. FMFF's own tile codec (see "Images"
+above) already indexes every tile by `(offset, length)`, so this turned
+out to need no new binary layout at all: a version (`add-version`) sits
+in the same tile index under a new layer code (`LAYER_VERSION` instead
+of `LAYER_FULL`), sharing the base image's tile grid and quality. A
+reader that only ever looked for `LAYER_FULL`/`LAYER_THUMB` entries --
+any FMFF build before this existed included -- simply never sees the
+extra entries and keeps decoding the base image exactly as it always
+did. Version labels/notes/timestamps ride in the same small JSON
+metadata blob tags and EXIF already use (see "Metadata" below), under a
+`"versions"` key.
+
+**Each version stores only what actually changed**, not a second full
+copy of the image -- the same "unchanged gets no entry at all" saving
+this file's own animation encoding already gives an identical frame
+(see "Each changed frame stores one rectangle" above), here applied to
+a version chain instead of a time axis. Concretely: every tile is
+re-encoded and compared, byte for byte, against whatever's currently
+the effective encoding at that position (version 0's tile, or the
+latest earlier version that touched it) -- comparing *encoded bytes*
+rather than raw pixels, since a lossy tile's own decode is never
+bit-exact and comparing against a decoded-and-requantized previous
+version would flag nearly everything as "changed" from quantization
+noise alone. A tile whose fresh encode matches isn't stored again.
+Measured on a real 1600x1200 test photo (392KB as a single version):
+a version that only retouches a small corner cost **3.5KB**, and a
+version pixel-identical to its predecessor (relabeling only, no edit)
+cost **0 bytes** of tile data -- versus a version that color-grades the
+*entire* photo, which still cost close to a second full copy (393KB),
+because that much of the image genuinely did change. This doesn't
+invent savings that aren't there; it just stops charging for the tiles
+that didn't need re-storing.
+
+- **Scoped to still images on purpose.** Video, audio, JPEG-passthrough,
+  and documents already store their content as one opaque blob apiece
+  (see their own sections above) with no per-tile addressing to append a
+  version into cheaply -- adding versioning there would mean a second,
+  much heavier mechanism, not a small extension of an existing one. An
+  *animated* image is excluded for a related reason: its entries carry
+  literal per-frame pixel rectangles instead of a fixed tile grid (see
+  "Each changed frame stores one rectangle" above), so there's no shared
+  per-version geometry the way a plain still's tile grid gives for free.
+- **Every version shares one quality setting.** A lossy tile's
+  dequantization at decode time uses the single, file-wide `quality`
+  header field -- there's nowhere in the format for a per-version
+  quality override, so `add-version` always encodes at the file's own
+  already-stored quality rather than accepting its own `--quality`.
+- **Alpha is a whole-file decision, not a per-version one.** The
+  header's `alpha=` flag is set once, from version 0, and every later
+  version conforms to it (a fully-opaque plane filled in if its own
+  source has none, or its alpha silently dropped if the file has none)
+  -- letting alpha appear/disappear version-by-version would make "did
+  this tile actually change" ambiguous right at that boundary, for no
+  real benefit most still images need.
+- **The trade-off**: every tile is still fully re-encoded during
+  `add-version` to find out whether it changed (there's no way to know
+  without racing it through the codec) -- the saving is in what gets
+  *written* to disk, not in encode time.
+- **Periodic full versions bound replay depth.** Reconstructing version N
+  means replaying every version between it and the nearest earlier
+  version that covers every tile -- left unbounded, a very long,
+  heavily-edited chain would cost more and more to decode as it grew.
+  So every 8th version (`VERSION_SNAPSHOT_INTERVAL`) is stored in full
+  regardless of what changed, the same "periodic checkpoint" idea
+  video's own I-frames use -- decoding version 1000 of a long chain
+  doesn't replay 1000 versions, only back to the nearest multiple of 8.
+  Measured on a real 20-version chain (each a small local edit): without
+  this, decoding version 20 would replay all 20 deltas on top of version
+  0; with it, decoding version 20 only replays back to version 16 (the
+  nearest checkpoint) -- **104 tiles touched instead of 120**, a gap
+  that only widens as a chain gets longer. The cost is one full version's
+  worth of extra storage every 8 versions, not every version.
+- CLI only for now -- the viewer doesn't have a version switcher yet.
+
+```
+python F.M.F.F.py encode photo.png photo.fmff --version-name original --version-note "as shot"
+python F.M.F.F.py add-version photo.fmff retouched.png --name retouched --note "background removed, color graded"
+python F.M.F.F.py add-version photo.fmff final.png --name final
+python F.M.F.F.py info photo.fmff                          # lists every version, with its size/note/timestamp
+python F.M.F.F.py decode photo.fmff out.png                 # no --version: decodes the most recently added one
+python F.M.F.F.py decode photo.fmff out.png --version 0     # by index -- 0 is always the original
+python F.M.F.F.py decode photo.fmff out.png --version retouched   # or by --name
+```
+
+## Selection masks -- an extra channel that isn't transparency
+
+A still image already has a per-pixel alpha channel for transparency
+(see "Images" above); a *mask* is the same idea -- a single 8-bit
+channel, same tile grid, same lossless codec -- but never composited
+into the picture. It's for a selection used to make a retouch, a
+subject/background split, or any other per-pixel annotation a caller
+wants back out unchanged, attached to a specific version (see
+"Versions" above) via `add-mask`. This is close to a clone of the
+existing alpha-plane machinery on purpose: a new tile plane
+(`PLANE_MASK`) reuses the same lossless encode/decode path alpha
+already has, just tagged so `full()`/`full_sequence()` skip it when
+reconstructing the actual image -- only `decode --mask` reads it.
+
+A mask belongs to exactly the version it was attached to, with no
+inheritance across the version chain the way an unedited color/alpha
+tile is inherited (see "Versions" above) -- a selection drawn for one
+retouch isn't implicitly still correct for a different, later one, and
+there'd be no reliable way to tell a deliberately-reused mask from one
+that simply wasn't revisited. Calling `add-mask` again for a version
+that already has one replaces it.
+
+```
+python F.M.F.F.py add-mask photo.fmff mask.png                    # attaches to the most recently added version
+python F.M.F.F.py add-mask photo.fmff mask.png --version 0        # or a specific version, by index or --name
+python F.M.F.F.py info photo.fmff                                  # shows "mask NNN B" next to any version that has one
+python F.M.F.F.py decode photo.fmff mask_out.png --mask             # extracts the mask instead of the image
+python F.M.F.F.py decode photo.fmff mask_out.png --mask --version 0
+```
+
+- CLI only, still-image-only, one mask per version -- same scope as
+  Versions above, for the same reasons (no fixed tile grid to share on
+  video/audio/JPEG-passthrough/documents or an animated image).
+- The mask image must match the file's own width/height exactly.
 
 ## JPEG sources -- lossless coefficient passthrough
 
@@ -512,6 +655,12 @@ This is a personal/hobby project, not a production tool:
 
 - Images: 8-bit RGB/RGBA only. Header fields for bit depth / color space
   are reserved for a future HDR extension but not implemented.
+- Images: versions (see "Versions" above) are still-image-only, CLI-only
+  (no viewer switcher yet), and share one quality setting across every
+  version in a file -- `add-version` always uses the file's own already-
+  stored quality, never a per-version override.
+- Images: selection masks (see "Selection masks" above) are one mask per
+  version, CLI-only, same still-image-only scope as versions.
 - Images: encoding is pure Python per-tile -- spread across CPU cores for
   large images (see "Multi-core encoding" above), but still Python-level
   work per tile, not a compiled codec, so it won't match a native
@@ -636,6 +785,11 @@ scenario, not as core format features:
 
 ```
 python F.M.F.F.py encode input.png output.fmff [--quality 80] [--tile-size 64]
+python F.M.F.F.py encode input.png output.fmff --version-name original --version-note "as shot"  # label version 0, see "Versions"
+python F.M.F.F.py add-version output.fmff retouched.png --name retouched --note "..."  # append another version, in place
+python F.M.F.F.py decode output.fmff result.png --version 0        # a specific version by index or --name (default: most recent)
+python F.M.F.F.py add-mask output.fmff mask.png [--version 0]      # attach a selection mask to a version, see "Selection masks"
+python F.M.F.F.py decode output.fmff mask.png --mask [--version 0] # extract a version's mask instead of the image
 python F.M.F.F.py encode input.gif output.fmff        # animated GIF/WebP/APNG source -> multi-frame .fmff, detected automatically
                                                        # (--tile-size is still-image only -- an animated source has no fixed tile grid, see "Each changed frame stores one rectangle" above)
 python F.M.F.F.py encode input.mp4 output.fmff [--crf 30] [--speed 8] [--fps 30]
