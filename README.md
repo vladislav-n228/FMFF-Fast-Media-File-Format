@@ -1,8 +1,10 @@
 # FMFF -- Fast Media File Format
 
-An experimental image/video/audio container (`.fmff`) with a reference
-Python encoder, decoder, and viewer. Images, video, and audio are
-handled very differently on purpose -- see below.
+An experimental image/video/audio/document container (`.fmff`) with a
+reference Python encoder, decoder, and viewer -- also distributed as a
+standalone Windows `.exe`, no Python install required (see "Windows
+.exe" below). Each content type is handled very differently on purpose
+-- see below.
 
 ## Images -- FMFF's own hybrid codec
 
@@ -100,6 +102,24 @@ This part is genuinely FMFF's own format, built around a few ideas:
   moving region on a large static canvas, no fixed tile size (from 32px
   up to one tile per frame) got the `.fmff` within 50% of the 40KB
   source -- this got it *smaller* than the source.
+- **...or several rectangles, when the change isn't one blob** -- a
+  single bounding box is only optimal when everything that changed is
+  clustered together. Content like a logo whose highlight sweeps through
+  more than one corner of an otherwise-static frame changes a handful of
+  small, far-apart spots each frame; one bbox around all of them
+  re-stores whatever untouched background sits between them too. So the
+  changed-pixel mask is first connected-component-labeled on a coarse
+  block grid (cheap -- cost tracks frame area, not changed-pixel count),
+  nearby components are coalesced (two small rectangles close together
+  cost more, each paying its own index row + CRC32 + compression
+  overhead, than one slightly larger one covering both), and the result
+  is however many tight, non-overlapping rectangles the change actually
+  needs -- capped at a dozen or so per frame, past which this falls back
+  to the single whole-frame bbox instead of paying for a pile of small
+  entries. Measured on a real 129-frame, 1080x1080 animated logo where
+  the highlight moves between corners: 17 of the 129 frames needed more
+  than one region (up to 12 in a single frame), and the file came out
+  6.6% smaller than the single-bbox approach on the same source.
 - **Faster on the large regions rectangle-per-frame storage produces** --
   storing one rectangle per changed frame instead of many small fixed
   tiles (above) means a single "tile" can now be a real fraction of a
@@ -235,13 +255,28 @@ corruption in dark scenes -- confirmed with a plain, never-touched-by-
 FMFF source video too, and confirmed absent in every other player on
 that system (Windows' own default player included), so it's a bug in
 ffplay/SDL on that system, not anything FMFF encodes or decodes.
-Opening a plain video file now hands it to whatever the OS has
-associated with it -- the same thing double-clicking it in
-Explorer/Finder does. A `.fmff` video stays inside FMFF's own viewer
-window on purpose, though, rather than handing off to some other
-application -- back to the same hardware-decoded, silent, looping
-in-window preview plain files fall back to when no default player is
-available (see "Status / limitations" below for that trade-off).
+Opening a plain video file, or a `.fmff` video, both hand off to
+whatever the OS has associated with `.mp4` -- the same thing double-
+clicking it in Explorer/Finder does, in its own window with real audio,
+seeking, and pause, rather than FMFF's own silent hardware-decoded loop
+(which is now only ever a fallback for when launching the default
+player fails outright, or the one exception below). An earlier version
+kept a `.fmff` video inside FMFF's own window "on purpose"; in practice
+that just meant no audio and no seek bar for the one case (FMFF's own
+files) where a good player experience mattered most, for no real
+benefit, so this now matches how a plain video file already behaved.
+
+One thing worth knowing if a `.fmff` video plays with no sound in
+Windows' own Movies & TV app specifically: the same Opus-in-fragmented-
+MP4 issue described for audio below applies to a video's audio track
+too (Movies & TV's Media Foundation pipeline doesn't reliably decode
+Opus unless it's wrapped in Ogg, which a video container obviously
+can't be). Since dropping the container isn't an option for video the
+way it is for audio, the viewer instead transcodes just the audio track
+to AAC (`-c:v copy`, so the video itself is a fast stream copy, not
+re-encoded) before handing the file to the default player -- the stored
+`.fmff` keeps its original Opus audio either way, this is a disposable
+playback-only copy.
 
 ### Subtitles
 
@@ -344,10 +379,9 @@ to whatever container the output extension needs (`-c:a copy` when the container
 verbatim -- `.opus`/`.ogg`/`.m4a` -- a real re-encode otherwise, e.g.
 `.mp3`/`.wav`/`.flac`, since those can't). The viewer opens either a
 plain audio file or an audio `.fmff` by handing it straight to the
-system's default player (real seek bar, volume, etc.) -- there's no
-picture to render in-window the way video has, so unlike a `.fmff`
-*video* (kept inside FMFF's own window on purpose, see above) there's
-nothing to trade off by using the system player here.
+system's default player (real seek bar, volume, etc.) -- the same thing
+a `.fmff` video now does too (see "Video" above), just with no picture
+to blit in-window while it's playing.
 
 What actually gets handed off for an audio `.fmff` isn't the raw
 extracted stream, though: `extract_media()` alone produces a
@@ -364,71 +398,57 @@ actually gets played. `decode`'s own `.opus`/`.ogg` output already used
 a proper (non-fragmented) Ogg container, so this was a viewer-playback-only
 issue, not a problem with `.fmff` files or `decode` output themselves.
 
-## Documents -- rasterized pages, not a document format
+## Documents -- the original file, not rendered pages
 
 PDF and `.txt` are the one case in this file that isn't media at all --
-text and layout, not pixels/frames/samples. FMFF doesn't gain a document
-format of its own here: each page is rasterized to a picture (PyMuPDF for
-PDF, Pillow's own font rendering onto a blank page for `.txt`) and stored
-as an ordinary multi-frame `.fmff`, the exact same container an animated
-GIF already uses -- one frame per page, no new header fields, no new
-decoder logic. **This is a real, deliberate trade-off, not a shortcut**:
-the result is a picture of each page, not the original document -- no
+text and layout, not pixels/frames/samples. An earlier version of this
+rasterized every page to a picture and stored the result as an ordinary
+multi-frame `.fmff`, the same container an animated GIF uses. That was a
+real, deliberate trade-off at the time, but it was the wrong one: no
 selectable/searchable text, no hyperlinks, no forms/formulas, nothing a
-real PDF/DOCX viewer gives you beyond what you can see. What it gets in
-return, for free, from being an ordinary multi-frame image: the same
-three-way lossless/palette/lossy race per page (a flat white-background
-text page is close to ideal palette-codec material -- almost all one
-color), the same per-page CRC32 error resilience, and `decode` to
-`.gif`/`.webp`/`.png`/`.apng` already hands every page back as one frame
-each with zero new code.
+real PDF/text viewer gives you beyond what you can see -- and, even after
+tuning (disabling anti-aliasing, using the no-fixed-grid path instead of
+the still-image tile grid), a rendered page still cost more bits than the
+already-compressed text/vector data it came from, so the result was
+routinely *bigger* than the source despite throwing all of that away. A
+worse result that's also less useful had nothing left to recommend it.
 
-A single-page document still goes through the same multi-frame path as a
-multi-page one (`encode_image_sequence`), never the still-image tile
-grid -- a rendered page is a large, mostly-flat, few-color image, which
-is close to a worst case for the still-image codec's small fixed tiles
-(they pay their own per-tile framing cost hundreds of times over for
-content that would rather be one big region): measured on a real single
-rendered page, the still-image path came out 4647% bigger than the
-source; the exact same page through the no-fixed-grid path came out only
-~2.6x the source for identical pixels -- 18x smaller for making the
-"page" itself the unit of compression instead of a 64px tile.
+FMFF now stores the document as itself: the original bytes, raced against
+a general-purpose compressor (the same lossless race JPEG passthrough
+uses for its own coefficients -- see "JPEG sources" above) and kept
+however comes out smaller. A PDF's internal streams are usually already
+Flate-compressed, so the original bytes often win outright there; a
+`.txt` source (not compressed to begin with) typically shrinks a lot.
+Either way this can never end up bigger than the source by more than this
+container's own small fixed overhead (header + index + one small preview
+thumbnail) -- measured on a real 3-page PDF, the `.fmff` came out **28%
+smaller** than the source; a real `.txt` file (this README, in fact) came
+out **61% smaller**. `decode` (or the viewer's Save as...) recovers the
+exact original bytes, byte-for-byte -- search, hyperlinks, and formulas
+all keep working in a real PDF/text viewer, because that's what's
+actually stored.
 
-A second, much bigger cost turned out to be self-inflicted rather than
-inherent, though: both PyMuPDF and Pillow anti-alias text by default --
-smoothing every glyph edge through dozens of intermediate gray shades
-(215 distinct colors measured from rendering a few words of text alone)
-for nicer-looking output. That's real per-pixel entropy along every
-letter that no codec here gets back for free, in exchange for smoother
-edges nothing about a compact document preview actually needs. Turning
-it off (PyMuPDF's global `TOOLS.set_aa_level(0)`; Pillow's own text
-drawing simply can't anti-alias onto a "1" (1-bit) mode image, so text
-is rendered there instead of directly on RGB) leaves every pixel cleanly
-text-color or background -- measured on one real text-heavy PDF page,
-that alone was a 3.2x difference (13,290 vs 4,142 bytes) for the exact
-same page, and took that page from bigger than its PDF source to smaller
-than it. A short `.txt` note went from 3928% bigger than its source to
-1434% -- still large in relative terms purely because the source was
-tiny to begin with (a fixed-size rasterized page has fixed-size costs
-regardless of how little text is on it), but a real, substantial cut.
-
-What's left after that *is* inherent, and won't go away with more
-tuning: rasterizing turns a compact vector/text representation into a
-full-resolution bitmap, so a document `.fmff` is still typically bigger
-than its source, especially for a short document, where the fixed cost
-of a rasterized page (however tightly compressed) is large relative to
-how little source text there was to begin with. This is the closest
-thing in FMFF to what rasterizing an SVG would be: a genuinely
-different, heavier representation of the same content, not a smaller
-one -- disabling anti-aliasing closes most of the *avoidable* gap, not
-the fundamental one.
+Rendering doesn't disappear, it just moves from being the storage format
+to being a *preview*: encoding still renders the first page (only the
+first -- cheap even for a huge PDF) for an instant-preview thumbnail, and
+the viewer re-renders every page on demand straight from the recovered
+original bytes when actually browsing a document `.fmff`, the exact same
+rendering path a plain, not-yet-converted PDF/`.txt` already uses. Anti-
+aliasing is still off for that rendering, for the same reason as before
+(smoother edges cost real bits a preview doesn't need), but it no longer
+affects the stored file's size at all -- only how the on-demand preview
+looks.
 
 Scoped deliberately to formats a lightweight, no-external-application
-dependency can rasterize: `pymupdf` (`pip install pymupdf`, a real
-library, no separate program) for PDF, nothing extra at all for `.txt`.
-Office formats (`.docx`/`.xlsx`/...) would need an external renderer
-(LibreOffice, run headless) -- a much heavier dependency than anything
-else this project asks for, left out of this pass on purpose.
+dependency can rasterize *for the preview*: `pymupdf` (`pip install
+pymupdf`, a real library, no separate program) for PDF, nothing extra at
+all for `.txt`. Office formats (`.docx`/`.xlsx`/...) would need an
+external renderer (LibreOffice, run headless) -- a much heavier
+dependency than anything else this project asks for, left out of this
+pass on purpose. Note that rendering is now optional in a way it never
+used to be: storing and recovering a document's bytes needs no rendering
+dependency at all -- `pymupdf` only matters for the PDF preview thumbnail
+and for browsing pages in the viewer, never for the data itself.
 
 ## Metadata -- tags and EXIF
 
@@ -502,18 +522,19 @@ This is a personal/hobby project, not a production tool:
   wrapped AV1 + Opus via FFmpeg" above). Alpha is supported (see "Video
   alpha" above) but only detected from a source that already has one;
   nothing converts an opaque video into a transparent one.
-- Video playback: a plain video file opens the system's default player
-  (real audio+video, in its own window); a `.fmff` video always plays
-  inside FMFF's own viewer window instead, which means the same
-  trade-off the fallback path always had -- silent, no seek bar, just a
-  hardware-decoded loop (real audio and seeking would mean handing the
-  window off to some other application, which is exactly what `.fmff`
-  playback is deliberately kept out of). A video with alpha always uses
-  this in-window path too (with real transparency), for the reason
-  given in "Video alpha" above.
-- Audio: only cover art is carried over as the thumbnail (see "Audio --
-  wrapped Opus via FFmpeg" above) -- other tags (artist, album, track
-  number, ...) aren't read or stored anywhere. Re-encoding to Opus is
+- Video playback: both a plain video file and a `.fmff` video open the
+  system's default player (real audio+video, seeking, in its own
+  window) -- FMFF's own silent, no-seek-bar, hardware-decoded in-window
+  loop is now only a fallback for when launching the default player
+  fails outright. A video with alpha is the one exception: it always
+  uses that in-window path (with real transparency, but silent even if
+  the source has audio), since no mainstream player composites two
+  separate tracks into transparency on the fly -- see "Video alpha"
+  above.
+- Audio: cover art is carried over as the thumbnail, and source tags
+  (artist, album, track number, ...) are preserved and restored on
+  decode too (see "Audio -- wrapped Opus via FFmpeg" above). Re-encoding
+  to Opus is
   also always a lossy transcode, same as re-encoding any lossy source
   through another lossy codec would be, even from an already-lossy
   source like MP3 (there's no coefficient-passthrough trick for audio
@@ -527,19 +548,67 @@ This is a personal/hobby project, not a production tool:
   itself supports (fairly little -- MP4's timed-text format is much
   simpler than ASS/SSA's own).
 - Documents: PDF and `.txt` only -- Office formats (`.docx`/`.xlsx`/...)
-  would need an external renderer (LibreOffice) not implemented here.
-  Rasterizing is a fundamentally lossy-of-structure operation regardless
-  of tuning: no selectable/searchable text, no hyperlinks, no forms, and
-  the result is typically still bigger than the source even after
-  disabling anti-aliasing (see "Documents" above for why the *remaining*
-  gap isn't fixable the way most other "bigger than source" cases
-  elsewhere in this file were). Anti-aliasing is off for rendered pages
-  by design (see "Documents" above for the size trade-off that buys), so
-  edges -- especially any actual line art in a PDF source, not just text
-  -- are visibly jaggier than a normal PDF viewer would show them.
+  would need an external renderer (LibreOffice) not implemented here. The
+  document itself is stored byte-for-byte (see "Documents" above), so
+  none of the old rasterization trade-offs apply any more -- text stays
+  selectable/searchable, hyperlinks and forms keep working, and the
+  `.fmff` is typically *smaller* than the source, not bigger. The only
+  thing that's still a rendered picture is the small first-page preview
+  thumbnail and the viewer's on-demand page browsing, neither of which
+  affects what's actually stored.
 
 **Don't use `.fmff` as the only copy of anything you care about** -- keep
 your originals.
+
+## Windows .exe -- no Python install needed
+
+The whole thing (encoder, decoder, CLI, and GUI viewer) is also
+distributed as a single standalone `F.M.F.F.exe` (built with PyInstaller,
+`pyinstaller F.M.F.F.spec`) attached to each [GitHub
+Release](https://github.com/vladislav-n228/FMFF-Fast-Media-File-Format/releases)
+-- not committed to the repo itself (a 100+MB binary has no business
+living in git history; see the `.gitignore`). FFmpeg still has to be on
+PATH separately either way -- it's a real external program FMFF only
+ever shells out to, packaging this into one `.exe` doesn't bundle it.
+
+A `multiprocessing.Pool`-based encode (see "Multi-core encoding" above)
+needs one specific piece of care to work correctly once frozen:
+`multiprocessing.freeze_support()` has to run as the very first thing in
+`if __name__ == "__main__":`, or every worker process would re-run the
+*whole program* from scratch on Windows instead of just bootstrapping as
+a worker -- for a large-enough encode job, that means each worker
+spawning its own full worker pool, recursively, without limit. This is
+the exact failure mode a from-source multiprocessing bug (unrelated to
+this file, a one-off test script missing its own `__main__` guard)
+already caused once during development, so it's called out here as a
+"don't remove this line" rather than a hypothetical.
+
+Double-clicking the `.exe` with no arguments opens the GUI viewer, same
+as `view` with no file; the console window that a plain console-
+subsystem build would otherwise show for that hides itself immediately
+on startup for `view`/`open-external` specifically (`encode`/`decode`/
+`info`/`register-filetype`/... still print normally when run from an
+actual terminal).
+
+Two extra CLI subcommands exist only for this packaged/double-click
+scenario, not as core format features:
+
+- **`open-external`** -- converts a `.fmff` to whatever ordinary format
+  its content already reduces to (video/audio/JPEG passthrough are
+  already a standard codec stream under FMFF's own header, so that's
+  just extracted; a still/animated image has no standalone equivalent,
+  so it's decoded through FMFF's own codec and re-saved as a plain PNG/
+  GIF/WebP) and hands the result to the system's default player --
+  headless, no FMFF GUI window at all. `--choose` shows Windows' native
+  "Open with" picker instead of silently using the remembered default.
+- **`register-filetype [--mode external|viewer]`** -- registers `.fmff`
+  as a real Windows file type for the current user only (`HKEY_CURRENT_
+  USER\Software\Classes`, no admin rights, nothing outside this one
+  account touched), so double-clicking a `.fmff` file in Explorer works
+  like any other media file instead of prompting "how do you want to
+  open this" every time with no memory of the answer. `--mode external`
+  (the default) wires a double-click to `open-external`; `--mode viewer`
+  opens FMFF's own GUI instead. `unregister-filetype` undoes it.
 
 ## Requirements
 
@@ -554,9 +623,12 @@ your originals.
 - `jpeglib` (optional, JPEG sources only: enables lossless coefficient
   passthrough; without it, JPEG encoding falls back to the normal tile
   codec at a lowered quality)
-- `pymupdf` (optional, PDF sources only: `pip install pymupdf` -- without
-  it, PDF encoding/preview raises a clear error; `.txt` needs nothing
-  beyond Pillow itself)
+- `pymupdf` (optional, PDF sources only, preview rendering only:
+  `pip install pymupdf` -- without it, encoding a PDF raises a clear
+  error (no first-page thumbnail to make), but this is only ever about
+  the preview -- storing/recovering the original PDF bytes themselves
+  needs no rendering dependency at all; `.txt` needs nothing beyond
+  Pillow itself)
 - `tkinterdnd2` (optional, viewer only: enables dragging files/folders
   onto the window; without it, use the Open/Batch... buttons instead)
 
@@ -573,13 +645,20 @@ python F.M.F.F.py decode output.fmff result.mp4        # .mp4 extracts the recon
 python F.M.F.F.py decode output.fmff result.mp4 --alpha-output alpha.mp4   # also pulls out the alpha track, if the source had one
 python F.M.F.F.py encode input.mp3 output.fmff [--audio-bitrate 96k]  # unset: auto-picked from the source's own bitrate, see "Audio" above
 python F.M.F.F.py decode output.fmff result.opus      # -c:a copy where the container allows it (.opus/.ogg/.m4a), a real transcode otherwise (.mp3/.wav/.flac/...)
-python F.M.F.F.py encode input.pdf output.fmff        # one rasterized page per frame -- a picture of each page, not the original document, see "Documents" above
-python F.M.F.F.py encode input.txt output.fmff        # word-wrapped/paginated onto pages the same way
-python F.M.F.F.py decode output.fmff result.gif       # every page back as one frame each; a still-image extension only ever gets page 1
+python F.M.F.F.py encode input.pdf output.fmff        # stores the original PDF bytes themselves (recompressed if smaller), see "Documents" above
+python F.M.F.F.py encode input.txt output.fmff        # same passthrough approach for a text file
+python F.M.F.F.py decode output.fmff result.pdf       # recovers the exact original bytes, byte-for-byte -- not a rendered page
 python F.M.F.F.py info output.fmff
 python F.M.F.F.py view [file]        # image / video / audio / document / .fmff viewer, Open/Screenshot/Save in the window
 python F.M.F.F.py output.fmff        # bare path also opens the viewer directly
+python F.M.F.F.py open-external output.fmff [--choose]   # headless: convert + hand off to an external player, no FMFF window -- see "Windows .exe" above
+python F.M.F.F.py register-filetype [--mode external|viewer]   # associate .fmff with double-click in Explorer (current user only)
+python F.M.F.F.py unregister-filetype
 ```
+
+The same commands work with `F.M.F.F.exe` in place of `python F.M.F.F.py`
+when running the packaged build instead of from source (see "Windows
+.exe" above).
 
 ## License
 
