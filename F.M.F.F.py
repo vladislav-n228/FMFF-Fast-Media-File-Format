@@ -74,6 +74,19 @@ jpeglib`; without it, or for a JPEG this can't handle (progressive scan,
 not 3-component), encoding falls back to the normal tile codec with an
 automatically-lowered quality (see _default_quality_for).
 
+A document (PDF/.txt) is a fourth case (content_mode 4, same layout as
+JPEG passthrough): the original file's bytes, not a rendered picture of
+its pages -- see encode_document's docstring, and the "document pages"
+section further down, for why an earlier version of this rasterized
+pages instead and what was wrong with that (no text layer/search/
+hyperlinks/forms, and routinely *bigger* than the source despite
+throwing all of that away). The bytes are raced against a general-
+purpose compressor and stored however comes out smaller, so this can
+never end up more than this container's own small fixed overhead
+bigger than the source. Decode recovers the exact original file,
+byte-for-byte; a small first-page render is stored only as an instant-
+preview thumbnail, not as the document's actual content.
+
 RGB / RGBA, 8-bit only for still images. Fields for bit depth / color
 space are reserved for a future HDR extension but not implemented yet.
 
@@ -195,6 +208,15 @@ CONTENT_JPEG_PASSTHROUGH = 2
 # content_mode only so the decoder can tell "this segmented blob is a
 # picture" from "this segmented blob is sound" apart.
 CONTENT_AUDIO = 3
+# A document (PDF/.txt) reuses JPEG-passthrough's single-opaque-blob
+# layout (see encode_image_jpeg_passthrough) rather than being a fifth
+# storage scheme of its own: the original file's bytes (optionally
+# recompressed losslessly, whichever is smaller -- see encode_document)
+# are the blob, exactly like a passthrough-stored JPEG's coefficients
+# are. It's a new content_mode only so the decoder can tell "this blob
+# is a repacked JPEG" from "this blob is a whole other file format"
+# apart -- see FMFFDecoder.extract_document.
+CONTENT_DOCUMENT = 4
 
 LAYER_THUMB = 0
 LAYER_FULL = 1
@@ -1263,26 +1285,47 @@ def _split_changed_regions(changed):
 
 # ------------------------------------------------------------ document pages
 # PDF/.txt aren't media in the sense anything else in this file is -- text
-# and layout, not pixels/frames/samples. FMFF doesn't gain a document format
-# of its own here: each page is rasterized to a picture and stored as an
-# ordinary multi-frame CONTENT_IMAGE .fmff, the exact same container an
-# animated GIF already uses (see encode_image_sequence) -- one "frame" per
-# page, no new header fields, no new decoder logic. That's a real, deliberate
-# trade: the result is a picture of each page, not the original document --
-# no selectable/searchable text, no hyperlinks, no forms/formulas, nothing
-# a real PDF/DOCX viewer gives you beyond what you can see. What it does get
-# for free from being an ordinary multi-frame image: the same three-way
-# lossless/palette/lossy race per page (flat white-background text pages are
-# close to ideal palette-codec material -- almost all one color), the same
-# per-page CRC32 error resilience, and `decode` to .gif/.webp/.png/.apng
-# already gives every page back as one frame each with zero new code.
+# and layout, not pixels/frames/samples. An earlier version of this
+# rasterized every page to a picture and stored the result as an ordinary
+# multi-frame CONTENT_IMAGE .fmff, the same container an animated GIF uses.
+# That traded away everything that makes a document a document -- no
+# selectable/searchable text, no hyperlinks, no forms/formulas -- and, on
+# top of throwing all of that away, routinely came out *bigger* than the
+# source: a rendered page of mostly-flat content still costs more bits than
+# the already-compressed text/vector data it was rendered from, even with
+# anti-aliasing off and the same three-way lossless/palette/lossy race
+# every image tile gets. A worse result that's also less useful is a bad
+# trade with nothing to recommend it, so this now stores the document
+# itself (CONTENT_DOCUMENT -- see encode_document), the same passthrough
+# philosophy as an already-lossy JPEG (see encode_image_jpeg_passthrough):
+# the original bytes, raced against a general-purpose compressor and kept
+# only if that's actually smaller, so this can never be bigger than the
+# source by more than the container's own small fixed overhead. Decode
+# gets back the exact original file, byte-for-byte -- text, links, forms,
+# and formulas all keep working in a real PDF/text viewer, because that's
+# what's actually stored.
 #
-# Deliberately scoped to formats a lightweight, no-external-app dependency
-# can rasterize: PyMuPDF for PDF (a real C library, `pip install pymupdf`,
-# no separate program to install), Pillow's own text/font rendering for
-# .txt. Office formats (.docx/.xlsx/...) would need an external renderer
+# Page rendering doesn't disappear, it just moves to being a *preview*
+# instead of the storage format: a single first-page thumbnail is stored
+# for an instant preview (see _render_document_thumbnail), and FMFF's own
+# viewer re-renders every page on demand straight from the recovered
+# original bytes when actually browsing one (see
+# MediaViewer._load_fmff_document) -- the exact same rendering path
+# (_render_document_pages) a plain, not-yet-converted PDF/.txt already
+# uses, so nothing about page rendering is duplicated for the .fmff case.
+#
+# Rendering (for the thumbnail and for on-demand browsing) is deliberately
+# scoped to formats a lightweight, no-external-app dependency can
+# rasterize: PyMuPDF for PDF (a real C library, `pip install pymupdf`, no
+# separate program to install), Pillow's own text/font rendering for .txt.
+# Office formats (.docx/.xlsx/...) would need an external renderer
 # (LibreOffice, run headless) -- a much heavier dependency (a whole desktop
-# application, not a pip package) deliberately left out of this pass.
+# application, not a pip package) deliberately left out of this pass. Note
+# that rendering is only ever a preview now, not a requirement for storage
+# or extraction: extract_document needs no rendering dependency at all (it
+# just returns the stored bytes), and PyMuPDF/a font is only ever needed
+# to produce a thumbnail/preview, never to keep the original document's
+# data intact.
 
 DOCUMENT_EXTS = {".pdf", ".txt"}
 DOCUMENT_RENDER_DPI = 150
@@ -1406,14 +1449,45 @@ def _render_text_pages(input_path):
 
 def _render_document_pages(input_path):
     """Dispatch to the right renderer for a document's extension -- shared
-    by FMFFEncoder.encode_document (writes the result to .fmff) and the
-    viewer (previews a plain, not-yet-converted PDF/.txt the same way,
-    without writing anything)."""
+    by MediaViewer._load_document_file/_load_fmff_document (previews a
+    PDF/.txt, plain or recovered from a .fmff, without writing anything
+    beyond what the caller already has) and cmd_decode (.fmff -> .gif/
+    .webp/.png of a document that was encoded the old way, before this
+    became a preview-only path -- see this section's own docstring)."""
     ext = Path(input_path).suffix.lower()
     if ext == ".pdf":
         return _render_pdf_pages(input_path)
     if ext == ".txt":
         return _render_text_pages(input_path)
+    raise ValueError(f"not a supported document type: {ext}")
+
+
+def _render_document_thumbnail(input_path):
+    """A single rendered page (the first) for a document's instant-
+    preview thumbnail (see encode_document) -- cheap even for a huge
+    PDF, unlike _render_document_pages (every page), which nothing
+    calls at encode time any more now that a document's pages are a
+    preview rather than the storage format themselves (see this
+    section's own docstring)."""
+    ext = Path(input_path).suffix.lower()
+    if ext == ".pdf":
+        if pymupdf is None:
+            raise RuntimeError(
+                "PDF encoding needs `pip install pymupdf` -- a first-page preview is "
+                "rendered for the thumbnail, so that's the only real dependency this "
+                "needs (the original PDF bytes are stored as-is either way)")
+        pymupdf.TOOLS.set_aa_level(0)
+        doc = pymupdf.open(str(input_path))
+        try:
+            if doc.page_count == 0:
+                raise ValueError(f"{input_path} has no pages")
+            pix = doc[0].get_pixmap(dpi=DOCUMENT_RENDER_DPI)
+            mode = "RGBA" if pix.alpha else "RGB"
+            return Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+        finally:
+            doc.close()
+    if ext == ".txt":
+        return _render_text_pages(input_path)[0]
     raise ValueError(f"not a supported document type: {ext}")
 
 
@@ -1556,28 +1630,99 @@ class FMFFEncoder:
         return self.encode_image(img, output_path)
 
     def encode_document(self, input_path, output_path):
-        """Rasterize a PDF/.txt into a .fmff, one page per frame -- see the
-        "document pages" section above for what this deliberately is and
-        isn't (a picture of each page, not the original document). Always
-        goes through encode_image_sequence, exactly like an animated
-        GIF/WebP/APNG source does, *even for a single page*: a document
-        page is a large, mostly-flat, few-color image (a photo-tile codec's
-        worst case for the still-image tile grid's fixed small tiles, which
-        pay their per-tile framing cost hundreds of times over for content
-        that would rather be one big region) -- measured on a real single-
-        page text render, going through the still-image path (encode_image)
-        came out 4647% bigger than the source; the exact same page through
-        encode_image_sequence's single-region-per-frame path (see its own
-        docstring for why that suits this kind of content) came out only
-        ~2.6x the source, an 18x smaller result for identical pixels. Per-
-        page duration is flat and otherwise meaningless -- "playback speed"
-        isn't a property a document has -- since decoding to .gif/.webp/
-        .png/.apng would just flip through pages at that rate, and decoding
-        to a still-image extension already only ever takes frame 0
-        regardless of what the durations say."""
-        pages = _render_document_pages(input_path)
-        durations = [1500] * len(pages)
-        return self.encode_image_sequence(pages, durations, output_path)
+        """Store a PDF/.txt as itself -- the original bytes, not a picture
+        of it. See this file's "document pages" section for the full
+        reasoning (an earlier version of this rasterized every page
+        instead, which was both less useful -- no text layer, search,
+        hyperlinks, forms, or formulas -- and, despite throwing all of
+        that away, routinely *bigger* than the source).
+
+        Mirrors encode_image_jpeg_passthrough's approach exactly: race
+        the original bytes against a general-purpose compressor (the
+        same _JPEG_COEFF_CODECS registry JPEG passthrough uses --
+        genuinely general-purpose despite the name) and keep whichever
+        is smaller, tagged the same way (a single leading byte: b"R" for
+        the original bytes verbatim, or one of _JPEG_COEFF_CODECS' own
+        tags for which compressor won). A PDF's internal streams are
+        usually already Flate-compressed, so recompression here often
+        can't improve much further and the original bytes win -- but a
+        .txt source (not compressed at all to start with) typically
+        shrinks a lot. Either way this can never end up bigger than the
+        source by more than this container's own small fixed overhead
+        (header + index + one small preview thumbnail) -- unlike the old
+        rasterize-everything approach, which routinely lost by several
+        times over.
+
+        The original document is fully intact inside the file: decode
+        (or extract_document directly) gets back the exact source bytes,
+        byte-for-byte. What FMFF's own viewer shows without a real PDF/
+        text reader is just a cheap first-page preview thumbnail (see
+        _render_document_thumbnail) -- full multi-page browsing
+        re-renders straight from the recovered original bytes (see
+        MediaViewer._load_fmff_document), not from anything stored
+        per-page here."""
+        original_bytes = Path(input_path).read_bytes()
+        tag, compressed = min(
+            ((tag, compress(original_bytes)) for tag, (compress, _) in _JPEG_COEFF_CODECS.items()),
+            key=lambda kv: len(kv[1]))
+        if len(compressed) < len(original_bytes):
+            blob, compressed_won = tag + compressed, True
+        else:
+            blob, compressed_won = b"R" + original_bytes, False
+
+        ext = Path(input_path).suffix.lower()
+        thumb_img = _render_document_thumbnail(input_path).convert("RGB")
+        width, height = thumb_img.size
+        # Same reasoning as encode_image_jpeg_passthrough's identical
+        # smaller-thumbnail-when-already-unbeatable trade: when the
+        # original bytes won (couldn't be shrunk further), the container's
+        # own fixed costs are the only thing separating this file from
+        # matching the source exactly, so keep that overhead as small as
+        # reasonably possible.
+        thumb_cap = self.thumb_max if compressed_won else max(16, self.thumb_max // 2)
+        tw, th, entries = _make_thumbnail_entries(thumb_img, thumb_cap, self.quality)
+
+        index_offset = HEADER_SIZE
+        frame_table_offset = index_offset + len(entries) * ENTRY_SIZE
+        data_offset = frame_table_offset
+        running = data_offset
+        for e in entries:
+            e.offset = running
+            running += e.length
+        media_blob_offset = running
+        media_blob_length = len(blob)
+        running += media_blob_length
+
+        # doc_ext travels in the generic tags mechanism (same JSON blob
+        # audio/video source tags use) rather than a new header field --
+        # extract_document needs it to know whether the recovered bytes
+        # are a PDF or a .txt when writing them back out to a real file.
+        metadata_blob = _pack_metadata({"doc_ext": ext}, None, None)
+        metadata_offset = running
+        running += len(metadata_blob)
+
+        header = struct.pack(
+            HEADER_FMT, MAGIC, VERSION, width, height, 8,
+            3, CONTENT_DOCUMENT, 0, 0, 0, 0, 0,
+            0, 0, 0, len(entries),
+            tw, th, HEADER_SIZE, index_offset, frame_table_offset, data_offset,
+            0, media_blob_offset, media_blob_length,
+            0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0,
+            metadata_offset, len(metadata_blob),
+        )
+        with open(output_path, "wb") as f:
+            f.write(header)
+            for e in entries:
+                f.write(e.pack())
+            for e in entries:
+                f.write(e.payload)
+            f.write(blob)
+            f.write(metadata_blob)
+
+        return {"width": width, "height": height, "size": running,
+                "mode": "document-passthrough", "compressed": compressed_won,
+                "source_ext": ext}
 
     def encode_image_jpeg_passthrough(self, input_path, output_path):
         """Losslessly repack an existing JPEG. First choice: pull its own
@@ -2314,11 +2459,7 @@ class FMFFDecoder:
         # always writes 0 regardless of frame count, since it never uses a
         # fixed grid at all (see its docstring) -- this is the actual,
         # robust signal for which addressing mode a CONTENT_IMAGE file's
-        # LAYER_FULL entries use (see full()/full_sequence()), not frame
-        # count: a *single-page* document (see encode_document) still goes
-        # through encode_image_sequence for its much better compression on
-        # that kind of content, so a naive "more than one frame" check
-        # would wrongly treat its one region as a grid cell instead.
+        # LAYER_FULL entries use (see full()/full_sequence()).
         self.has_fixed_tile_grid = color_space == CONTENT_IMAGE and tile_size > 0
         # The wire `is_video` flag really means "read a segment table
         # instead of a tile index" -- true for CONTENT_AUDIO too (see
@@ -2327,6 +2468,7 @@ class FMFFDecoder:
         self.is_video = bool(is_video) and color_space == CONTENT_VIDEO
         self.is_audio = bool(is_video) and color_space == CONTENT_AUDIO
         self.is_jpeg_passthrough = (color_space == CONTENT_JPEG_PASSTHROUGH)
+        self.is_document = (color_space == CONTENT_DOCUMENT)
         if self.is_audio:
             # frame_count/fps_x100 hold duration_ms/sample_rate instead
             # for audio (see HEADER_FMT's comment) -- frame_count/fps
@@ -2475,10 +2617,8 @@ class FMFFDecoder:
         Good for random access to a single frame of a file that uses a
         fixed tile grid (see has_fixed_tile_grid) -- an ordinary still
         image, always. A file without one -- an actual multi-frame
-        animation, or a single-page document from encode_document, which
-        goes through the same no-fixed-grid path for its own reasons --
-        has LAYER_FULL entries that carry literal pixel (x, y) rectangles
-        rather than tile-grid indices (see encode_image_sequence), so
+        animation -- has LAYER_FULL entries that carry literal pixel
+        (x, y) rectangles rather than tile-grid indices (see encode_image_sequence), so
         there's no per-position key to look up "whichever frame at or
         before N last touched this spot" the way a fixed grid allows --
         reconstructing frame N means replaying frames 0..N in order,
@@ -2556,10 +2696,7 @@ class FMFFDecoder:
         # A file without a fixed tile grid carries literal pixel (x, y)
         # entries; one with a fixed grid carries tile-grid indices that
         # need scaling by tile_size -- see encode_image vs
-        # encode_image_sequence, and has_fixed_tile_grid's own comment
-        # for why this is keyed off that rather than frame count (a
-        # single-page document from encode_document is one frame but
-        # still has no fixed grid).
+        # encode_image_sequence.
         literal_coords = not self.has_fixed_tile_grid
         ts = self.tile_size
         frames_out = []
@@ -2583,6 +2720,26 @@ class FMFFDecoder:
             if progress_cb:
                 progress_cb(frame, n_frames)
         return frames_out
+
+    def extract_document(self, out_path=None):
+        """Reconstruct the original PDF/.txt bytes exactly -- see
+        FMFFEncoder.encode_document. The document counterpart to
+        extract_media, using the same single-leading-tag-byte scheme
+        _decode_jpeg_passthrough does (b"R" = the original bytes
+        verbatim; one of _JPEG_COEFF_CODECS' own tags = which
+        general-purpose compressor was raced and won). Returns the
+        bytes either way; writes them to out_path too when given.
+        Needs no rendering dependency (PyMuPDF, a font) at all -- unlike
+        a thumbnail/preview, the stored bytes themselves never went
+        through rendering to begin with."""
+        with open(self.path, "rb") as f:
+            f.seek(self.media_blob_offset)
+            blob = f.read(self.media_blob_length)
+        tag, payload = blob[:1], blob[1:]
+        data = payload if tag == b"R" else _JPEG_COEFF_CODECS[tag][1](payload)
+        if out_path is not None:
+            Path(out_path).write_bytes(data)
+        return data
 
     def _decode_jpeg_passthrough(self):
         """Reconstruct pixels from the JPEG's own coefficients (see
@@ -3252,14 +3409,33 @@ class MediaViewer:
         d = FMFFDecoder(path)
         self.current_is_video = d.is_video
         self.current_is_audio = d.is_audio
+        self.current_is_document = d.is_document
         if d.is_video:
             self._load_fmff_video(d)
         elif d.is_audio:
             self._load_fmff_audio(d)
+        elif d.is_document:
+            self._load_fmff_document(d)
         elif d.is_animated:
             self._load_fmff_animated(d)
         else:
             self._load_fmff_image(d)
+
+    def _load_fmff_document(self, d):
+        """An .fmff document (see FMFFEncoder.encode_document): the
+        original PDF/.txt bytes are recovered byte-for-byte to a temp
+        file and handed straight to _load_document_file -- the exact
+        same page-rendering path a plain, not-yet-converted PDF/.txt
+        already uses, so browsing looks identical either way and
+        nothing about rendering pages is duplicated for the .fmff case.
+        Save as... reads straight from the original .fmff file itself
+        (see _save_document), not from this temp copy, which is thrown
+        away with the rest of tmp_dir once the OS gets around to it."""
+        ext = d.tags.get("doc_ext", ".pdf")
+        tmp_dir = tempfile.mkdtemp(prefix="fmff_view_")
+        doc_path = os.path.join(tmp_dir, "document" + ext)
+        d.extract_document(doc_path)
+        self._load_document_file(doc_path)
 
     def _load_fmff_animated(self, d):
         """An .fmff with more than one frame (see encode_image_sequence)
@@ -3739,6 +3915,10 @@ class MediaViewer:
                 filetypes=[("FMFF", "*.fmff"), ("Opus", "*.opus"), ("OGG", "*.ogg"),
                            ("M4A", "*.m4a"), ("MP3", "*.mp3"), ("WAV", "*.wav"),
                            ("FLAC", "*.flac")])
+        elif self.current_is_document:
+            path = filedialog.asksaveasfilename(
+                defaultextension=".fmff",
+                filetypes=[("FMFF", "*.fmff"), ("PDF", "*.pdf"), ("Text", "*.txt")])
         else:
             if self.current_pil is None:
                 self.set_status("nothing to save")
@@ -3767,16 +3947,7 @@ class MediaViewer:
         # a live video/animation would keep overwriting the frame under the
         # busy veil (and race the encoder if it's an fmff video) -- freeze it
         self._cancel_background()
-        # A document always goes through encode_image_sequence even for a
-        # single page, same as encode_document itself and for the same
-        # reason (see its docstring): the still-image tile grid is a bad
-        # fit for a large, mostly-flat rendered page, measured at 18x
-        # bigger for identical pixels. Without checking is_document here
-        # too, saving a *one-page* PDF/.txt preview as .fmff would silently
-        # take the plain still-image path below instead and pay that same
-        # cost -- len(anim_frames) > 1 alone can't tell a genuine single-
-        # page document apart from a genuine single-frame non-document image.
-        is_animated = anim_frames is not None and (len(anim_frames) > 1 or is_document)
+        is_animated = anim_frames is not None and len(anim_frames) > 1
 
         def progress_cb(percent):
             self.q.put(("busy", (percent, "Converting")))
@@ -3789,6 +3960,9 @@ class MediaViewer:
                 elif is_audio:
                     self.q.put(("busy", (None, "Converting")))
                     _save_audio(source_path, is_fmff, path, dest_ext, progress_cb)
+                elif is_document:
+                    self.q.put(("busy", (None, "Converting")))
+                    _save_document(source_path, is_fmff, path, dest_ext, progress_cb)
                 elif dest_ext == ".fmff":
                     self.q.put(("busy", (None, "Encoding")))
                     quality = _default_quality_for(source_path or "", None)
@@ -3943,6 +4117,32 @@ def _save_audio(source_path, is_fmff, path, dest_ext, progress_cb):
         raise ValueError(f"can't save audio as {dest_ext or '(no extension)'}")
 
 
+def _save_document(source_path, is_fmff, path, dest_ext, progress_cb):
+    """Save the original document (not the rendered preview pages -- see
+    _load_document_file/_load_fmff_document, neither of which loads a
+    document into self.current_pil the way an actual picture would)
+    either as .fmff or back out to a real PDF/.txt file -- the document
+    counterpart to _save_audio/_save_video. is_fmff's original bytes are
+    passed straight through either way: to .fmff they're already exactly
+    that (a plain copyfile, same as _save_audio/_save_video do for their
+    own already-.fmff case); to a document extension,
+    FMFFDecoder.extract_document recovers the exact original bytes
+    FMFFEncoder.encode_document stored, byte-for-byte."""
+    if dest_ext == ".fmff":
+        if is_fmff:
+            shutil.copyfile(source_path, path)
+        else:
+            FMFFEncoder().encode_document(source_path, path)
+    elif dest_ext in DOCUMENT_EXTS:
+        if is_fmff:
+            FMFFDecoder(source_path).extract_document(path)
+        else:
+            shutil.copyfile(source_path, path)
+    else:
+        raise ValueError(f"can't save a document as {dest_ext or '(no extension)'}")
+    progress_cb(100)
+
+
 # ------------------------------------------------------------------------ CLI
 
 DEFAULT_QUALITY = 80
@@ -4050,6 +4250,17 @@ def cmd_encode(args):
                       f"its own (likely already-optimized) Huffman tables, so the original JPEG "
                       f"bytes were stored as-is instead -- still lossless, just not smaller")
             print(f"  {stats['width']}x{stats['height']}")
+        elif stats.get("mode") == "document-passthrough":
+            if stats["compressed"]:
+                print(f"  document passthrough ({stats['source_ext']}): recompressed losslessly "
+                      f"with a general-purpose compressor (smaller than the source, quality="
+                      f"{quality} was not used -- this is lossless, not a picture of the pages)")
+            else:
+                print(f"  document passthrough ({stats['source_ext']}): recompression didn't beat "
+                      f"the source's own encoding, so the original bytes were stored as-is instead "
+                      f"-- still exact, just not smaller")
+            print(f"  {stats['width']}x{stats['height']} (first-page preview thumbnail only -- "
+                  f"the whole document is stored, not rendered pages)")
         else:
             if args.quality is None and quality != DEFAULT_QUALITY:
                 if Path(args.input).suffix.lower() in ALREADY_LOSSY_EXTS:
@@ -4073,6 +4284,20 @@ def cmd_encode(args):
 def cmd_decode(args):
     dec = FMFFDecoder(args.input)
     out_ext = Path(args.output).suffix.lower()
+
+    if dec.is_document:
+        # No transcoding to do or choose between -- the stored bytes ARE
+        # the original document (see FMFFEncoder.encode_document), so
+        # this just writes them back out exactly, regardless of what
+        # extension args.output happens to have.
+        doc_ext = dec.tags.get("doc_ext", "")
+        if out_ext and out_ext != doc_ext:
+            print(f"  note: this document was originally {doc_ext or 'unknown'} -- writing "
+                  f"the recovered bytes to {args.output} as given, extension mismatch and all")
+        dec.extract_document(args.output)
+        print(f"decoded {args.input} -> {args.output} "
+              f"({dec.media_blob_length} bytes recovered, byte-for-byte)")
+        return
 
     if dec.is_video:
         # The .mp4 fast path skips FFmpeg entirely (extract_media() alone
@@ -4247,18 +4472,18 @@ def cmd_open_external(args):
     whatever ordinary format its content already reduces to, and hand
     that off to an external player instead of FMFF's own viewer.
 
-    Video, audio, and JPEG-passthrough content already ARE a standard
-    codec stream sitting under FMFF's own header (see the module
-    docstring's container-layout sections) -- extracting that (via
-    cmd_decode, reused as-is here rather than duplicated) is no lossier
-    than cmd_decode already is on its own. A still or animated image is
-    FMFF's own proprietary tile codec, with no equivalent standalone
-    stream to just pull out -- getting pixels out of it always needs
-    FMFF's own decoder, no way around that specific part -- but the
-    *result* (an ordinary PNG/GIF/WebP written to a temp file) is
-    standalone from that point on, so what actually reaches the
-    external player is still a completely normal file it needs no
-    FMFF-awareness to open.
+    Video, audio, document, and JPEG-passthrough content already ARE a
+    standard file/codec stream sitting under FMFF's own header (see the
+    module docstring's container-layout sections and encode_document)
+    -- extracting that (via cmd_decode, reused as-is here rather than
+    duplicated) is no lossier than cmd_decode already is on its own. A
+    still or animated image is FMFF's own proprietary tile codec, with
+    no equivalent standalone stream to just pull out -- getting pixels
+    out of it always needs FMFF's own decoder, no way around that
+    specific part -- but the *result* (an ordinary PNG/GIF/WebP written
+    to a temp file) is standalone from that point on, so what actually
+    reaches the external player is still a completely normal file it
+    needs no FMFF-awareness to open.
 
     --choose shows Windows' own "Open with" picker (whatever's
     installed and registered, not a hand-maintained list here) instead
@@ -4272,6 +4497,8 @@ def cmd_open_external(args):
         out_ext = ".opus" if _find_ffmpeg() else ".mp4"
     elif dec.is_jpeg_passthrough:
         out_ext = ".jpg"
+    elif dec.is_document:
+        out_ext = dec.tags.get("doc_ext", ".pdf")
     elif dec.is_animated:
         out_ext = ".webp" if dec.has_alpha else ".gif"
     else:
@@ -4398,15 +4625,26 @@ def cmd_info(args):
                   "(not FMFF's own tile codec)")
         print(f"blob: {dec.media_blob_length} bytes")
         print(f"thumbnail {dec.thumb_w}x{dec.thumb_h}")
+    elif dec.is_document:
+        with open(dec.path, "rb") as f:
+            f.seek(dec.media_blob_offset)
+            kind = f.read(1)
+        doc_ext = dec.tags.get("doc_ext", "?")
+        if kind == b"R":
+            print(f"document passthrough ({doc_ext}): original bytes stored verbatim "
+                  f"(recompression didn't beat the source's own encoding)")
+        else:
+            print(f"document passthrough ({doc_ext}): recompressed losslessly with a "
+                  f"general-purpose compressor (smaller than the source)")
+        print(f"blob: {dec.media_blob_length} bytes")
+        print(f"thumbnail {dec.thumb_w}x{dec.thumb_h} (first-page preview only -- "
+              f"the full document is the blob above, not a per-page render)")
     else:
         color_entries = [e for e in dec.entries if e.layer == LAYER_FULL and e.plane == PLANE_COLOR]
         if not dec.has_fixed_tile_grid:
             # No fixed tile grid (see encode_image_sequence) --
             # tile_size/tiles_x/tiles_y aren't meaningful here, so show
-            # the changed-region sizes instead. Covers both an actual
-            # multi-frame animation and a single-page document from
-            # encode_document, which goes through the same no-fixed-grid
-            # path for its own reasons (see has_fixed_tile_grid).
+            # the changed-region sizes instead.
             sizes = [e.w * e.h for e in color_entries]
             avg_px = sum(sizes) / len(sizes) if sizes else 0
             n_frames_changed = len({e.frame for e in color_entries})
