@@ -32,6 +32,7 @@ import re
 import subprocess
 import sys
 import time
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -151,8 +152,17 @@ def generate_test_images(out_dir, size):
     w, h = size
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = []
+    # zlib.crc32, not Python's builtin hash() -- str hashing is salted
+    # per-process (PYTHONHASHSEED) since Python 3.3 for security reasons,
+    # so hash(name) silently gave a *different* per-category seed every
+    # run despite this function's whole point being reproducibility. Two
+    # runs' "identical" synthetic images differed by a little as a result
+    # (confirmed: source PNG bytes for the same category varied run to
+    # run) -- exactly the kind of quiet benchmark-integrity bug this
+    # project's own "Benchmarks" README section promises not to have.
+    # crc32 is stable across processes and Python versions.
     for name, gen in GENERATORS.items():
-        rng = np.random.default_rng(RNG_SEED + abs(hash(name)) % 1000)
+        rng = np.random.default_rng(RNG_SEED + zlib.crc32(name.encode()) % 1000)
         img = gen(rng, w, h)
         p = out_dir / f"{name}.png"
         img.save(p, optimize=True)
@@ -164,7 +174,8 @@ def generate_test_images(out_dir, size):
 # Encoders under test
 # ------------------------------------------------------------------ #
 
-INFO_TILES_RE = re.compile(r"color tiles:\s*(\d+) lossless,\s*(\d+) lossy,\s*(\d+) palette")
+INFO_TILES_RE = re.compile(
+    r"color tiles:\s*(\d+) lossless,\s*(\d+) lossy,\s*(\d+) palette,\s*(\d+) raw")
 
 
 def encode_png(src_img, out_path):
@@ -195,7 +206,8 @@ def encode_fmff(src_path, out_path, quality):
         cwd=REPO_ROOT, check=True, capture_output=True, text=True,
     ).stdout
     m = INFO_TILES_RE.search(info)
-    mode = f"{m.group(1)} lossless / {m.group(2)} lossy / {m.group(3)} palette" if m else "?"
+    mode = (f"{m.group(1)} lossless / {m.group(2)} lossy / {m.group(3)} palette / {m.group(4)} raw"
+            if m else "?")
     return elapsed, out_path.stat().st_size, mode
 
 

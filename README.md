@@ -32,17 +32,92 @@ This part is genuinely FMFF's own format, built around a few ideas:
 - **Instant indexing** -- a fixed-size header at byte 0 plus a tile index
   right after it, so a reader knows where everything is without scanning
   the file.
-- **Hybrid lossless/palette/lossy tiles** -- each tile is raced three
+- **Hybrid lossless/palette/lossy/raw tiles** -- each tile is raced four
   ways: a PNG-style lossless filter (zlib), a lossless palette/indexed-
   color encoding (a small per-tile color table plus a 1-byte-per-pixel
-  index, for any tile with 256 or fewer distinct colors), and a
-  JPEG-style lossy DCT codec (zlib/bz2, whichever is smaller); whichever
-  of the three comes out smallest is kept. Flat/text/line-art regions
-  (and anything that started out palette-based, GIF included) stay
-  pixel-exact and small, while photo/gradient regions compress hard.
-  The palette candidate can only ever win the race or lose it, never
-  make a tile worse -- the other two are still computed and compared
+  index, for any tile with 256 or fewer distinct colors), a JPEG-style
+  lossy DCT codec (whichever of zlib/bz2/zstd is smaller -- see below),
+  and the tile's own
+  raw, uncompressed bytes as a last-resort floor; whichever of the four
+  comes out smallest is kept. Flat/text/line-art regions (and anything
+  that started out palette-based, GIF included) stay pixel-exact and
+  small, while photo/gradient regions compress hard. The raw candidate
+  matters for small/edge tiles specifically -- found by digging into a
+  real report of file bloat that turned out to have a different root
+  cause (the "source" file was actually WebP wearing a `.png` extension,
+  not a bug here -- see "Benchmarks" below), but the investigation
+  surfaced a real, separate gap along the way: a tiny tile (the partial
+  ones a non-tile-size-multiple image edge always has) could have every
+  compressed candidate cost *more* than its own raw pixel data once
+  zlib/bz2's own per-stream framing was added on top, with no floor to
+  catch it -- confirmed directly: a 1x1 tile that used to cost more than
+  its 3 raw bytes now costs exactly 3. The palette and raw candidates can
+  each only ever win the race or lose it, never make a tile worse -- the
+  other two are still computed and compared
   every time.
+- **A third entropy-coding candidate, `zstandard` (optional -- `pip
+  install zstandard`), races alongside zlib/bz2** -- the same tag-and-
+  race pattern this file already used for lossless/palette/lossy/raw,
+  just one level down, on the general-purpose compression step every
+  lossy tile and every palette index stream already goes through. Level
+  12, chosen the same way `_ZLIB_LEVEL` was: measured against zlib/bz2
+  on real byte-packed tile data from an actual photo, not guessed --
+  level 19+ measured ~0.4% smaller than 12 for roughly double the time,
+  the same "diminishing returns past a point" shape; level 12 was both
+  smaller *and* faster than zlib level 6 in that same measurement. Real
+  effect on the benchmark images (see "Benchmarks" below): under 1% to
+  ~9% smaller on top of everything else here, none of them bigger, and
+  biggest on palette-heavy content (screenshot/pixel-art) since palette
+  index bytes race through the same three compressors too. Optional and
+  gracefully degrading like
+  jpeglib/pymupdf/tkinterdnd2 elsewhere in this file: encoding without it
+  installed just means zlib/bz2 alone contest that race (still correct,
+  slightly bigger on average); a file that does have a zstd-compressed
+  tile needs it installed to decode *that* tile, with a clear error
+  naming exactly that instead of a bare crash if it's missing.
+- **The lossy candidate now subsamples chroma, orders its coefficients
+  the way real JPEG does, and packs them distribution-aware instead of
+  at a fixed width** -- three separate gaps a from-scratch look at this
+  codec's own code turned up, each closing part of the size gap against
+  WebP at matched quality (see "Benchmarks" below): it used to transform
+  Cb/Cr at the same full resolution as luma (no other lossy photo codec
+  spends bits on chroma detail that way) -- now Cb/Cr are downsampled 2x
+  per axis before transforming (4:2:0, same as JPEG/WebP). It used to
+  serialize each block's quantized DCT coefficients in plain raster
+  order, fixed at 2 bytes each, straight into zlib/bz2 -- now each
+  block's coefficients are zigzag-reordered with the DC term delta-coded
+  against the previous block's (the same DPCM trick this file already
+  used for JPEG passthrough, see "JPEG sources" below), a block's
+  trailing run of zeros past its last nonzero coefficient is cut
+  outright (an EOB marker, not just compressed), and each surviving
+  coefficient is usually one byte instead of a fixed two, with a rare
+  out-of-range one escaping to its own slot instead of forcing every
+  coefficient to pay for the exceptional one -- all still fully
+  vectorized (no per-coefficient Python loop), short of real JPEG's own
+  bit-level Huffman/arithmetic coding but built on the same two ideas.
+  Verified bit-for-bit lossless relative to the pre-repack coefficients
+  (same DCT, same quantization -- only how the result is packed into
+  bytes changed) before ever measuring size. Together, measured on two
+  synthetic photo-like benchmark images: output shrank 51-52% at the
+  same quality setting versus before any of this, cutting the size gap
+  against WebP at matched quality roughly in half again on top of the
+  chroma/zigzag fix alone.
+- **The base quantization table is the "ImageMagick community" table,
+  not the 1992 JPEG Annex K default** -- checked against mozjpeg's own
+  `jcparam.c` before assuming anything (mozjpeg's real advantage turned
+  out to be trellis quantization and better Huffman tables, not a
+  different default matrix -- its default is the same 1992 table this
+  codec used before, so an earlier draft of this note was wrong to credit
+  the swap to "mozjpeg's tables"). mozjpeg does bundle several published
+  alternative tables as a selectable, non-default option, including one
+  credited there to an ImageMagick community thread reporting a better
+  quality/size trade-off for photographic content; swapped in and
+  measured here rather than taken on faith. Real effect, on the same
+  controlled before/after images (see "Benchmarks" below): meaningfully
+  smaller on the smooth-photo and random-noise cases (-9%, -6%), roughly
+  flat on flat/palette-friendly content, very slightly bigger (+1.9%) on
+  the busier/textured photo case -- a genuine, disclosed trade-off, not a
+  strict win everywhere.
 - **True-color alpha** -- transparency is stored per-pixel (not 1-bit),
   losslessly.
 - **Chunked/streamable** -- every tile has its own (offset, length) in the
@@ -685,7 +760,12 @@ downloaded or committed to this repo; the script generates its own test
 images from a fixed seed, so anyone can reproduce (or challenge) these
 exact numbers on their own machine, and `--images-dir` swaps in real
 images instead of the synthetic stand-ins if you'd rather benchmark
-actual content.
+actual content. (One bug in that reproducibility claim already found and
+fixed: the per-category seed used Python's built-in `hash()` on a string,
+which is randomized per process since Python 3.3 -- so two "identical"
+runs quietly generated slightly different images. Swapped for `zlib.crc32`,
+which isn't process-randomized; confirmed by running the whole benchmark
+twice in a row and diffing the output byte-for-byte.)
 
 Run it yourself: `python benchmarks/bench_images.py`. Full results (with
 methodology notes and per-image pixel-fidelity numbers) land in
@@ -695,31 +775,56 @@ lossy-vs-lossy comparison is fair):
 
 | content type | FMFF vs PNG | FMFF vs WebP q80 |
 |---|---|---|
-| smooth photo-like | 83% smaller | 431% bigger |
-| detailed/textured photo-like | 71% smaller | 301% bigger |
-| UI/screenshot mockup | 157% bigger | 159% bigger |
-| pixel art / low-color sprite | 194% bigger | 1% bigger |
-| line art | 12% bigger | 49% smaller |
-| random noise (worst case) | 47% smaller | 132% bigger |
+| smooth photo-like | 92% smaller | 147% bigger |
+| detailed/textured photo-like | 86% smaller | 95% bigger |
+| UI/screenshot mockup | 113% bigger | 115% bigger |
+| pixel art / low-color sprite | 139% bigger | 16% smaller |
+| line art | 10% bigger | 54% smaller |
+| random noise (worst case) | 78% smaller | 2% smaller |
 
-**The honest reading of this**: FMFF's own lossy tile codec is not
+**The honest reading of this**: FMFF's own lossy tile codec still isn't
 competitive with WebP's on raw compression ratio for photographic
-content -- WebP's predictive lossy codec is a more modern design than
-FMFF's JPEG-style per-tile DCT, and that gap is real, not a benchmark
-artifact (consistent with "encoding is pure Python per-tile" in "Status /
-limitations" below). FMFF beats PNG on most content (PNG has no lossy
-mode to fall back to when one would help) and wins outright on line art
-specifically; it loses on the flat/UI screenshot case too, where WebP's
-whole-image lossless prediction beats FMFF's smaller, per-tile palette
-encoding. FMFF's actual reason to exist isn't winning a compression-ratio
-contest against a mature, heavily-optimized format -- it's versioning,
-true-color alpha, and per-tile error resilience, none of which PNG or
-WebP has at all (see the top of this README and "Versions" below). Take
-the compression numbers at face value rather than a pitch that hides
-them; video/audio aren't included in this benchmark since they're just
-FFmpeg's own AV1/Opus encoders wrapped in this container (see "Video" and
-"Audio" above) -- comparing those would mostly measure this container's
-own small fixed overhead, not a codec FMFF wrote.
+content, but it's a lot closer than it started out -- the very first
+version of this benchmark showed 301-431% bigger than WebP on the two
+photo-like cases; it's 95-147% now, after fixing five concrete gaps found
+by reading the codec's own code (see "Hybrid lossless/palette/lossy
+tiles" above for what each one was): no chroma subsampling, no zigzag
+coefficient ordering or DC delta-coding, a fixed 2-bytes-per-coefficient
+encoding with no EOB-style cut of a block's trailing zero run, a
+quantization table swap verified on real before/after numbers rather than
+assumed (see "The base quantization table" above -- a small, mixed
+result: better on smooth photo/noise content, very slightly worse on
+busy/textured photo content, disclosed rather than cherry-picked), and an
+optional `zstandard` candidate added to the compression race (see "A
+third entropy-coding candidate" above). Even the random-noise worst case,
+which has no exploitable structure for any of this to find, went from
+132% bigger than WebP at the very start to 2% *smaller*. What's left of
+the remaining photo-content gap is believed to be WebP's more modern
+predictive lossy design against FMFF's still-fundamentally-JPEG-style
+per-tile DCT, entropy-coded with a general-purpose compressor (zlib/bz2/
+zstd) over a byte-packed stream rather than true coefficient-aware
+bit-level Huffman/arithmetic coding -- consistent with "encoding is pure
+Python per-tile" in "Status / limitations" below (closing that last gap
+for real would mean a bit-level Huffman/arithmetic coder, which this
+project has so far avoided as a large jump in implementation risk -- a
+subtly broken bit-packer corrupts images silently -- for a shrinking
+remaining return, and spatial prediction between blocks the way WebP
+itself does would mean giving up the independent, streamable/resilient
+tile design this container is actually built around -- see "Chunked/
+streamable" and "Error resilience" above). FMFF beats PNG on most content
+(PNG has no lossy mode to fall back to when one would help) and wins
+outright on line art and pixel art; it loses on the flat/UI screenshot
+case, where WebP's whole-image lossless prediction beats FMFF's smaller,
+per-tile palette encoding. FMFF's actual reason to exist
+isn't winning a compression-ratio contest against a mature,
+heavily-optimized format -- it's versioning, true-color alpha, and
+per-tile error resilience, none of which PNG or WebP has at all (see the
+top of this README and "Versions" below). Take the compression numbers
+at face value rather than a pitch that hides them; video/audio aren't
+included in this benchmark since they're just FFmpeg's own AV1/Opus
+encoders wrapped in this container (see "Video" and "Audio" above) --
+comparing those would mostly measure this container's own small fixed
+overhead, not a codec FMFF wrote.
 
 ## Status / limitations
 
@@ -888,6 +993,12 @@ optional libraries an error actually came from.
   Pillow itself)
 - `tkinterdnd2` (optional, viewer only: enables dragging files/folders
   onto the window; without it, use the Open/Batch... buttons instead)
+- `zstandard` (optional, images only: `pip install zstandard` -- adds a
+  3rd candidate to the tile compression race alongside zlib/bz2, usually
+  both smaller and faster than either; without it, tiles are still
+  correct, just raced between zlib/bz2 alone. A file that does have a
+  zstd-compressed tile needs this installed to decode *that* tile --
+  `doctor` flags this specifically if it comes up)
 
 ## Usage
 

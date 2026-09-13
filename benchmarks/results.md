@@ -12,11 +12,11 @@ FMFF quality=80, WebP lossy quality=80 (matched for a fair comparison), tile-siz
 
 | image | dims | source PNG | PNG (re-opt) | WebP lossless | WebP q80 | FMFF | FMFF vs PNG | FMFF vs WebP | FMFF tile mix | max pixel diff |
 |---|---|---|---|---|---|---|---|---|---|---|
-| photo_smooth | 640x480 | 573,987 B | 573,987 B | 554,906 B | 18,490 B | 98,201 B | -82.9% | +431.1% | 0 lossless / 80 lossy / 0 palette | 31 |
-| photo_detailed | 640x480 | 326,620 B | 326,620 B | 214,366 B | 23,772 B | 95,424 B | -70.8% | +301.4% | 0 lossless / 80 lossy / 0 palette | 11 |
-| screenshot_ui | 640x480 | 3,839 B | 3,839 B | 1,072 B | 3,804 B | 9,850 B | +156.6% | +158.9% | 0 lossless / 0 lossy / 80 palette | 0 |
-| pixel_art | 640x480 | 4,141 B | 4,141 B | 1,140 B | 12,008 B | 12,167 B | +193.8% | +1.3% | 0 lossless / 0 lossy / 80 palette | 0 |
-| line_art | 640x480 | 14,338 B | 14,338 B | 7,584 B | 31,712 B | 16,114 B | +12.4% | -49.2% | 0 lossless / 0 lossy / 80 palette | 0 |
-| random_noise | 640x480 | 923,405 B | 923,405 B | 921,680 B | 211,532 B | 490,291 B | -46.9% | +131.8% | 0 lossless / 80 lossy / 0 palette | 93 |
+| photo_smooth | 640x480 | 573,867 B | 573,867 B | 555,276 B | 17,840 B | 44,072 B | -92.3% | +147.0% | 0 lossless / 80 lossy / 0 palette / 0 raw | 30 |
+| photo_detailed | 640x480 | 329,337 B | 329,337 B | 216,136 B | 23,772 B | 46,334 B | -85.9% | +94.9% | 0 lossless / 80 lossy / 0 palette / 0 raw | 18 |
+| screenshot_ui | 640x480 | 3,839 B | 3,839 B | 1,072 B | 3,804 B | 8,168 B | +112.8% | +114.7% | 0 lossless / 7 lossy / 73 palette / 0 raw | 42 |
+| pixel_art | 640x480 | 4,119 B | 4,119 B | 1,148 B | 11,760 B | 9,847 B | +139.1% | -16.3% | 0 lossless / 0 lossy / 80 palette / 0 raw | 0 |
+| line_art | 640x480 | 13,251 B | 13,251 B | 7,264 B | 31,892 B | 14,556 B | +9.8% | -54.4% | 0 lossless / 10 lossy / 70 palette / 0 raw | 1 |
+| random_noise | 640x480 | 923,408 B | 923,408 B | 921,680 B | 211,354 B | 207,302 B | -77.6% | -1.9% | 0 lossless / 80 lossy / 0 palette / 0 raw | 253 |
 
 "FMFF vs PNG/WebP" is the size difference in percent -- negative means FMFF is smaller. "max pixel diff" is the largest per-channel 0-255 difference between the decoded `.fmff` and the source, over every pixel -- 0 for an image whose tiles all won the lossless/palette race, nonzero (but should stay small at quality 80) wherever the lossy DCT candidate won instead.

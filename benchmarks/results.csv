@@ -1,7 +1,7 @@
 image,dims,source_png_bytes,png_bytes,png_s,webp_lossless_bytes,webp_lossless_s,webp_q80_bytes,webp_q80_s,fmff_bytes,fmff_s,fmff_tile_mix,fmff_vs_png_pct,fmff_vs_webp_q_pct,fmff_max_pixel_diff
-photo_smooth,640x480,573987,573987,0.055,554906,0.401,18490,0.1,98201,1.689,0 lossless / 80 lossy / 0 palette,-82.9,431.1,31
-photo_detailed,640x480,326620,326620,0.215,214366,0.385,23772,0.07,95424,1.55,0 lossless / 80 lossy / 0 palette,-70.8,301.4,11
-screenshot_ui,640x480,3839,3839,0.01,1072,0.019,3804,0.042,9850,1.297,0 lossless / 0 lossy / 80 palette,156.6,158.9,0
-pixel_art,640x480,4141,4141,0.013,1140,0.02,12008,0.046,12167,1.359,0 lossless / 0 lossy / 80 palette,193.8,1.3,0
-line_art,640x480,14338,14338,0.023,7584,0.013,31712,0.062,16114,1.307,0 lossless / 0 lossy / 80 palette,12.4,-49.2,0
-random_noise,640x480,923405,923405,0.033,921680,0.099,211532,0.199,490291,1.443,0 lossless / 80 lossy / 0 palette,-46.9,131.8,93
+photo_smooth,640x480,573867,573867,0.043,555276,0.36,17840,0.084,44072,1.325,0 lossless / 80 lossy / 0 palette / 0 raw,-92.3,147.0,30
+photo_detailed,640x480,329337,329337,0.193,216136,0.349,23772,0.065,46334,1.323,0 lossless / 80 lossy / 0 palette / 0 raw,-85.9,94.9,18
+screenshot_ui,640x480,3839,3839,0.01,1072,0.05,3804,0.039,8168,1.298,0 lossless / 7 lossy / 73 palette / 0 raw,112.8,114.7,42
+pixel_art,640x480,4119,4119,0.014,1148,0.018,11760,0.046,9847,1.401,0 lossless / 0 lossy / 80 palette / 0 raw,139.1,-16.3,0
+line_art,640x480,13251,13251,0.019,7264,0.012,31892,0.063,14556,1.323,0 lossless / 10 lossy / 70 palette / 0 raw,9.8,-54.4,1
+random_noise,640x480,923408,923408,0.032,921680,0.066,211354,0.192,207302,1.348,0 lossless / 80 lossy / 0 palette / 0 raw,-77.6,-1.9,253

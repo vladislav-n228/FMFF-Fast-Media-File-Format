@@ -183,8 +183,13 @@ try:
 except ImportError:
     rawpy = None
 
+try:
+    import zstandard
+except ImportError:
+    zstandard = None
+
 MAGIC = b"FMFF"
-VERSION = 13
+VERSION = 14
 
 # Target length of one independently CRC32-checked, droppable video
 # fragment -- see the module docstring's "Container layout for a video"
@@ -232,6 +237,25 @@ MODE_LOSSY = 1
 # this before being expanded to RGB -- stores far smaller this way than
 # 3 raw bytes/pixel ever can, filtered-and-zlib'd or not.
 MODE_PALETTE = 2
+# A fourth, last-resort candidate in the same race (see
+# _race_color_candidates): the tile's raw RGB bytes, utterly uncompressed.
+# Real content this ever wins on is content none of the other three
+# candidates can find any redundancy in at all -- fine-grained noise/
+# grain/dithering dense enough that a zlib stream (MODE_LOSSLESS), a DCT
+# quantized and byte-packed (MODE_LOSSY), or a >256-color palette
+# (MODE_PALETTE, which will not even enter this race for such a tile)
+# each individually cost *more* than 3 plain bytes/pixel once their own
+# framing/stream overhead is added on top. Without this, a tile like that
+# had no floor: every candidate could come out bigger than the source
+# pixel data ever was, and the tile would still store whichever happened
+# to be *least* bad -- the same "recompression doesn't always win, so
+# keep the original when it doesn't" idea JPEG passthrough and document
+# passthrough already use elsewhere in this file (see "JPEG sources" /
+# "Documents" in the README), just applied per-tile here instead of to
+# a whole file. It can only ever win the race or lose it, exactly like
+# the palette candidate -- the other three are still computed and
+# compared every time.
+MODE_RAW = 3
 
 # content_mode (stored in the header's former "color_space" byte -- that
 # field was never used for anything else): which of FMFF's storage
@@ -348,26 +372,59 @@ def _dct_matrix(n=8):
 
 _T = _dct_matrix(8)
 
+
+def _make_zigzag_index(n=8):
+    """Flat (row-major, i*n+j) indices of an n x n block's cells in classic
+    JPEG zigzag scan order -- low frequencies (near the DC term at index 0)
+    first, so the mostly-zero high-frequency tail after quantization ends
+    up contiguous. Generated from the standard anti-diagonal traversal
+    (direction alternates each diagonal) rather than hand-transcribed, to
+    not risk a transcription error in a 64-entry table nothing would catch
+    except a subtly wrong compression ratio."""
+    order = []
+    for s in range(2 * n - 1):
+        if s % 2 == 0:
+            rows = range(min(s, n - 1), max(-1, s - n), -1)
+        else:
+            rows = range(max(0, s - n + 1), min(s, n - 1) + 1)
+        order.extend(i * n + (s - i) for i in rows)
+    return np.array(order, dtype=np.int64)
+
+
+_ZIGZAG_IDX = _make_zigzag_index(8)
+
+# The classic 1992 ITU-T T.81 Annex K "example" tables (what plain
+# libjpeg and, by default, mozjpeg both still ship -- verified straight
+# from mozjpeg's own jcparam.c before assuming otherwise: mozjpeg's real
+# quality/size advantage comes from trellis quantization and better
+# Huffman tables, not a different default quant matrix). Swapped here for
+# the "ImageMagick community" table mozjpeg also bundles as a selectable
+# (non-default) alternative -- sourced from the same jcparam.c, credited
+# there to http://www.imagemagick.org/discourse-server/viewtopic.php?f=22&t=20333&p=98008#p98008,
+# and reported in that community's own testing as a better quality/size
+# trade-off for photographic content than the 1992 default. Verified by
+# measurement here too, not just cited -- see "Benchmarks" in the README
+# for the actual before/after this made.
 _LUMA_Q = np.array([
-    [16, 11, 10, 16, 24, 40, 51, 61],
-    [12, 12, 14, 19, 26, 58, 60, 55],
-    [14, 13, 16, 24, 40, 57, 69, 56],
-    [14, 17, 22, 29, 51, 87, 80, 62],
-    [18, 22, 37, 56, 68, 109, 103, 77],
-    [24, 35, 55, 64, 81, 104, 113, 92],
-    [49, 64, 78, 87, 103, 121, 120, 101],
-    [72, 92, 95, 98, 112, 100, 103, 99],
+    [16, 16, 16, 18, 25, 37, 56, 85],
+    [16, 17, 20, 27, 34, 40, 53, 75],
+    [16, 20, 24, 31, 43, 62, 91, 135],
+    [18, 27, 31, 40, 53, 74, 106, 156],
+    [25, 34, 43, 53, 69, 94, 131, 189],
+    [37, 40, 62, 74, 94, 124, 169, 238],
+    [56, 53, 91, 106, 131, 169, 226, 311],
+    [85, 75, 135, 156, 189, 238, 311, 418],
 ], dtype=np.float32)
 
 _CHROMA_Q = np.array([
-    [17, 18, 24, 47, 99, 99, 99, 99],
-    [18, 21, 26, 66, 99, 99, 99, 99],
-    [24, 26, 56, 99, 99, 99, 99, 99],
-    [47, 66, 99, 99, 99, 99, 99, 99],
-    [99, 99, 99, 99, 99, 99, 99, 99],
-    [99, 99, 99, 99, 99, 99, 99, 99],
-    [99, 99, 99, 99, 99, 99, 99, 99],
-    [99, 99, 99, 99, 99, 99, 99, 99],
+    [16, 16, 16, 18, 25, 37, 56, 85],
+    [16, 17, 20, 27, 34, 40, 53, 75],
+    [16, 20, 24, 31, 43, 62, 91, 135],
+    [18, 27, 31, 40, 53, 74, 106, 156],
+    [25, 34, 43, 53, 69, 94, 131, 189],
+    [37, 40, 62, 74, 94, 124, 169, 238],
+    [56, 53, 91, 106, 131, 169, 226, 311],
+    [85, 75, 135, 156, 189, 238, 311, 418],
 ], dtype=np.float32)
 
 
@@ -467,16 +524,186 @@ def lossless_decode(data, c, h, w):
 
 _TILE_LOSSY_CODECS = {b"Z": (lambda b: zlib.compress(b, _ZLIB_LEVEL), zlib.decompress),
                       b"B": (lambda b: bz2.compress(b, 9), bz2.decompress)}
+# A third race entrant, only when `zstandard` (pip install zstandard) is
+# actually installed -- optional the same way jpeglib/pymupdf/rawpy are
+# (see doctor and README's Requirements). Level 12: measured against
+# zlib/bz2 on real byte-packed tile data (a real photo's worth of tiles,
+# not a guess) -- level 19+ found ~0.4% smaller than 12 for roughly
+# double the time, the same "diminishing returns past a point" shape
+# _ZLIB_LEVEL's own comment already found for zlib; 12 was consistently
+# both smaller *and* faster than zlib level 6 in that same measurement.
+# A decoder missing zstandard can still open a file with no zstd-tagged
+# tiles in it at all; one that does need it gets a clear, actionable
+# error (see _decompress_tile_bytes) instead of a bare KeyError.
+if zstandard is not None:
+    _ZSTD_LEVEL = 12
+    _zstd_compress = zstandard.ZstdCompressor(level=_ZSTD_LEVEL).compress
+    _zstd_decompress = zstandard.ZstdDecompressor().decompress
+    _TILE_LOSSY_CODECS[b"S"] = (_zstd_compress, _zstd_decompress)
+
+
+def _decompress_tile_bytes(data):
+    """Looks up data's leading 1-byte compressor tag in _TILE_LOSSY_CODECS
+    and decompresses the rest -- shared by lossy_decode and
+    _palette_decode so a missing optional compressor (currently just
+    zstd) gives the same clear error in both places instead of a bare
+    KeyError wherever this happens to get called from."""
+    tag = data[:1]
+    codec = _TILE_LOSSY_CODECS.get(tag)
+    if codec is None:
+        if tag == b"S":
+            raise RuntimeError(
+                "this tile was compressed with zstd, which needs `pip install zstandard` "
+                "(not installed on this machine, but was on whichever machine encoded this "
+                "file) -- run `python F.M.F.F.py doctor` to check what else might be missing")
+        raise ValueError(f"unknown tile compressor tag {tag!r} -- file may be corrupt "
+                          f"or from a newer/incompatible build")
+    return codec[1](data[1:])
+
+
+def _downsample_chroma(plane):
+    """2x2 box average -- plane's dims are always even here (the caller
+    pads the tile to a multiple of 16, not just 8, specifically so this
+    lands on a clean grid)."""
+    h, w = plane.shape
+    return plane.reshape(h // 2, 2, w // 2, 2).mean(axis=(1, 3))
+
+
+def _upsample_chroma(plane):
+    """Nearest-neighbor 2x2 upsampling -- what most real JPEG decoders do
+    by default; a fancier reconstruction filter buys little on a plane
+    that's already been through quantization at half resolution."""
+    return np.repeat(np.repeat(plane, 2, axis=0), 2, axis=1)
+
+
+def _zigzag_and_dc_delta(quant_blocks):
+    """quant_blocks: (nby, nbx, 8, 8) int16 quantized coefficients, in
+    raster block order -> (nby*nbx, 64) int16, each block reordered into
+    zigzag scan order (low frequencies first, so the mostly-zero high-
+    frequency tail after quantization ends up contiguous at the end of
+    each row -- exactly what _pack_channel's EOB-style cut below needs)
+    with its DC term (index 0 after the reorder) replaced by the delta
+    from the previous block's DC -- neighboring tile regions of a photo
+    usually have similar average brightness/color, so this turns that
+    column mostly small instead of raw values, the same DPCM trick
+    already used for real JPEG passthrough elsewhere in this file (see
+    "JPEG sources" in the README), just not previously applied to this
+    codec's own lossy path."""
+    nby, nbx = quant_blocks.shape[:2]
+    zz = quant_blocks.reshape(nby * nbx, 64)[:, _ZIGZAG_IDX].copy()
+    dc = zz[:, 0].astype(np.int32)
+    zz[:, 0] = np.diff(dc, prepend=np.int32(0)).astype(np.int16)
+    return zz
+
+
+def _undo_zigzag_and_dc_delta(zz, nby, nbx):
+    dc = np.cumsum(zz[:, 0].astype(np.int32))
+    raster = np.empty((nby * nbx, 64), dtype=np.int32)
+    raster[:, 0] = dc
+    raster[:, 1:] = zz[:, 1:]
+    out = np.empty_like(raster)
+    out[:, _ZIGZAG_IDX] = raster
+    return out.reshape(nby, nbx, 8, 8)
+
+
+# A generic byte-oriented compressor (zlib/bz2) still has to run on
+# whatever this hands it, but real JPEG's actual edge over that is two
+# distribution-specific tricks neither compressor knows to apply on its
+# own: an EOB marker to skip a block's trailing run of (post-zigzag,
+# post-quantization) zeros outright instead of merely compressing them,
+# and coding each small coefficient in only as many bits as it needs
+# instead of a fixed width. Implementing that as literal bit-packed
+# Huffman/arithmetic coding would mean either a per-coefficient Python
+# loop (this file avoids exactly that everywhere else, for real measured
+# reasons -- see "Multi-core encoding" in the README) or a much larger,
+# easier-to-get-subtly-wrong vectorized bit-packer. _PACK_ESCAPE below is
+# the same two ideas at byte granularity instead of bit granularity:
+# still fully vectorized, no per-coefficient loop, real measurable size
+# reduction, at the cost of not squeezing out the last bit real JPEG's
+# own entropy coder would.
+_PACK_ESCAPE = np.int8(-128)
+
+
+def _pack_channel(zz):
+    """zz: (nblocks, 64) int16, already zigzag+DC-delta coded -> bytes:
+    [nblocks x uint8 counts][sum(counts) x int8 values][n_escapes x int16
+    raw values]. `counts[i]` is an EOB-style cut: how many of block i's
+    64 zigzag-ordered coefficients actually need storing (index of its
+    last nonzero, +1; 0 for an all-zero block) -- the trailing run of
+    zeros past that point is implied, never written at all. Each kept
+    coefficient is then usually one signed byte instead of a fixed two;
+    the rare one that doesn't fit in [-127, 127] is flagged with the
+    -128 sentinel in its byte slot and its real value appended to a
+    small escape list instead, so the common case never pays for the
+    exceptional one."""
+    nblocks = zz.shape[0]
+    nonzero = zz != 0
+    has_nonzero = nonzero.any(axis=1)
+    last_idx = 63 - np.argmax(nonzero[:, ::-1], axis=1)
+    counts = np.where(has_nonzero, last_idx + 1, 0).astype(np.uint8)
+
+    keep_mask = np.arange(64)[None, :] < counts[:, None].astype(np.int64)
+    flat_values = zz[keep_mask]
+
+    needs_escape = (flat_values < -127) | (flat_values > 127)
+    narrow = np.where(needs_escape, _PACK_ESCAPE, flat_values).astype(np.int8)
+    escapes = flat_values[needs_escape].astype(np.int16)
+
+    return counts.tobytes() + narrow.tobytes() + escapes.tobytes()
+
+
+def _unpack_channel(buf, offset, nblocks):
+    """Inverse of _pack_channel -- reads one channel's packed bytes
+    starting at byte `offset` into `buf`, returns ((nblocks, 64) int16
+    zigzag-order coefficients, offset just past what this channel used).
+    Needs no stored length for the value stream: nblocks (from the
+    tile's own dimensions -- see lossy_decode) fixes how many counts to
+    read, their sum fixes how many packed values follow, and counting
+    -128 sentinels in those fixes how many escape values follow -- every
+    length here falls out of what was already read, nothing extra to
+    store or get out of sync."""
+    counts = np.frombuffer(buf, dtype=np.uint8, count=nblocks, offset=offset)
+    offset += nblocks
+    total_kept = int(counts.sum())
+    narrow = np.frombuffer(buf, dtype=np.int8, count=total_kept, offset=offset)
+    offset += total_kept
+    needs_escape = narrow == _PACK_ESCAPE
+    n_escape = int(needs_escape.sum())
+    escapes = np.frombuffer(buf, dtype=np.int16, count=n_escape, offset=offset)
+    offset += n_escape * 2
+
+    flat_values = narrow.astype(np.int16)
+    flat_values[needs_escape] = escapes
+
+    keep_mask = np.arange(64)[None, :] < counts.astype(np.int64)[:, None]
+    zz = np.zeros((nblocks, 64), dtype=np.int16)
+    zz[keep_mask] = flat_values
+    return zz, offset
+
 
 def lossy_encode(rgb_tile, quality):
     h, w = rgb_tile.shape[:2]
-    ph, pw = -(-h // 8) * 8, -(-w // 8) * 8
+    # Padded to a multiple of 16, not just 8 -- the two chroma planes are
+    # downsampled 2x per axis right below (4:2:0 subsampling), so this is
+    # what keeps *them* landing on a clean 8x8 block grid of their own.
+    ph, pw = -(-h // 16) * 16, -(-w // 16) * 16
     ycc = _rgb_to_ycc(_pad_to(rgb_tile, ph, pw).astype(np.float32)) - 128.0
 
     lq, cq = _scale_quant(_LUMA_Q, quality), _scale_quant(_CHROMA_Q, quality)
     out = []
-    for ch, q in ((0, lq), (1, cq), (2, cq)):
-        blocks = _to_blocks(ycc[:, :, ch])
+    # 4:2:0 chroma subsampling: Cb/Cr carry far less perceptually relevant
+    # detail than luma, so real photo codecs (JPEG, WebP, ...) halve each
+    # chroma plane per axis -- a 4x cut in that plane's own coefficient
+    # count -- before transforming it at all. This tile codec used to
+    # transform all three channels at full tile resolution instead, which
+    # meant a large, avoidable share of its lossy output was chroma data
+    # no other lossy image codec bothers spending bits on.
+    for q, plane in (
+        (lq, ycc[:, :, 0]),
+        (cq, _downsample_chroma(ycc[:, :, 1])),
+        (cq, _downsample_chroma(ycc[:, :, 2])),
+    ):
+        blocks = _to_blocks(plane)
         # T @ block @ T.T per 8x8 block, batched over the (nby, nbx) leading
         # dims via @'s stacked-matrix broadcasting -- numerically identical
         # to the equivalent np.einsum("ij,abjk,kl->abil", ...) (previously
@@ -486,8 +713,9 @@ def lossy_encode(rgb_tile, quality):
         # once the tile-grid rewrite let a single "tile" cover a big region
         # (see encode_image_sequence) instead of many small 64x64 ones.
         coeffs = _T @ blocks @ _T.T
-        out.append(np.round(coeffs / q).astype(np.int16))
-    raw = np.concatenate([o.ravel() for o in out]).tobytes()
+        quant = np.round(coeffs / q).astype(np.int16)
+        out.append(_pack_channel(_zigzag_and_dc_delta(quant)))
+    raw = b"".join(out)
     tag, payload = min(
         ((t, c(raw)) for t, (c, _) in _TILE_LOSSY_CODECS.items()),
         key=lambda kv: len(kv[1]))
@@ -495,19 +723,22 @@ def lossy_encode(rgb_tile, quality):
 
 
 def lossy_decode(data, h, w, quality):
-    ph, pw = -(-h // 8) * 8, -(-w // 8) * 8
+    ph, pw = -(-h // 16) * 16, -(-w // 16) * 16
     nby, nbx = ph // 8, pw // 8
-    flat = np.frombuffer(_TILE_LOSSY_CODECS[data[:1]][1](data[1:]), dtype=np.int16)
-    per_ch = nby * nbx * 64
+    cby, cbx = ph // 16, pw // 16  # chroma's own block grid, half res per axis
+    buf = _decompress_tile_bytes(data)
     lq, cq = _scale_quant(_LUMA_Q, quality), _scale_quant(_CHROMA_Q, quality)
 
     ycc = np.empty((ph, pw, 3), dtype=np.float32)
-    for i, q in enumerate((lq, cq, cq)):
-        coeffs = flat[i * per_ch:(i + 1) * per_ch].reshape(nby, nbx, 8, 8).astype(np.float32) * q
+    offset = 0
+    for i, (q, nby_i, nbx_i) in enumerate(((lq, nby, nbx), (cq, cby, cbx), (cq, cby, cbx))):
+        zz, offset = _unpack_channel(buf, offset, nby_i * nbx_i)
+        quant = _undo_zigzag_and_dc_delta(zz, nby_i, nbx_i).astype(np.float32) * q
         # See lossy_encode's forward transform for why this is @ instead
         # of einsum -- same T.T @ block @ T per block, ~19x faster.
-        blocks = _T.T @ coeffs @ _T
-        ycc[:, :, i] = _from_blocks(blocks, ph, pw)
+        blocks = _T.T @ quant @ _T
+        plane = _from_blocks(blocks, nby_i * 8, nbx_i * 8)
+        ycc[:, :, i] = plane if i == 0 else _upsample_chroma(plane)
 
     rgb = _ycc_to_rgb(ycc + 128.0)
     return np.clip(rgb[:h, :w, :], 0, 255).astype(np.uint8)
@@ -552,7 +783,7 @@ def _palette_decode(data, h, w):
     off = 2
     palette = np.frombuffer(data, dtype=np.uint8, count=n_colors * 3, offset=off).reshape(n_colors, 3)
     off += n_colors * 3
-    idx_bytes = _TILE_LOSSY_CODECS[data[off:off + 1]][1](data[off + 1:])
+    idx_bytes = _decompress_tile_bytes(data[off:])
     idx = np.frombuffer(idx_bytes, dtype=np.uint8, count=h * w).reshape(h, w)
     return palette[idx]
 
@@ -1113,13 +1344,15 @@ FrameEntry = namedtuple("FrameEntry", "timestamp_ms entry_start entry_count")
 
 
 def _race_color_candidates(rgb_tile, quality):
-    """Encode one RGB tile (or thumbnail) three ways -- PNG-style lossless
-    filter+zlib, DCT lossy, and palette/indexed-color (see _palette_encode)
-    -- and keep whichever comes out smallest. Shared by _encode_tile_task
-    and _make_thumbnail_entries so both get the same three-way race."""
+    """Encode one RGB tile (or thumbnail) four ways -- PNG-style lossless
+    filter+zlib, DCT lossy, palette/indexed-color (see _palette_encode),
+    and plain uncompressed raw bytes (see MODE_RAW) -- and keep whichever
+    comes out smallest. Shared by _encode_tile_task and
+    _make_thumbnail_entries so both get the same four-way race."""
     lossless_bytes = lossless_encode(rgb_tile.transpose(2, 0, 1))
     lossy_bytes = lossy_encode(rgb_tile, quality)
-    candidates = [(MODE_LOSSLESS, lossless_bytes), (MODE_LOSSY, lossy_bytes)]
+    candidates = [(MODE_LOSSLESS, lossless_bytes), (MODE_LOSSY, lossy_bytes),
+                  (MODE_RAW, rgb_tile.tobytes())]
     palette_bytes = _palette_encode(rgb_tile)
     if palette_bytes is not None:
         candidates.append((MODE_PALETTE, palette_bytes))
@@ -1289,6 +1522,8 @@ def _decode_tile_bytes(data, entry, quality):
         return lossy_decode(data, entry.h, entry.w, quality)
     if entry.mode == MODE_PALETTE:
         return _palette_decode(data, entry.h, entry.w)
+    if entry.mode == MODE_RAW:
+        return np.frombuffer(data, dtype=np.uint8).reshape(entry.h, entry.w, 3)
     return lossless_decode(data, 3, entry.h, entry.w).transpose(1, 2, 0)
 
 
@@ -3923,6 +4158,8 @@ class MediaViewer:
         self.playback_fps = 60
         self._fmff_buffer = None
         self._anim_frames = None
+        self._fmff_versions = []
+        self._fmff_current_version = 0
 
     # -- window / widgets ------------------------------------------------
 
@@ -3950,6 +4187,21 @@ class MediaViewer:
         tk.Button(toolbar, textvariable=self.fps_var, command=self.on_fps_click, bg=DARK_BTN, fg=DARK_FG,
                   activebackground="#454545", activeforeground=DARK_FG,
                   relief="flat", padx=10, pady=4).pack(side="left", padx=4, pady=4)
+
+        # Version switcher -- only ever packed (made visible) by
+        # _update_version_menu, when the .fmff just opened is a still
+        # image with more than one version (see FMFFDecoder.list_versions).
+        # A Menubutton+Menu instead of a ttk.Combobox so it matches this
+        # toolbar's plain-tk dark styling instead of introducing ttk's own
+        # separate theming just for one widget.
+        self.version_var = tk.StringVar(value="Version")
+        self.version_menubutton = tk.Menubutton(
+            toolbar, textvariable=self.version_var, bg=DARK_BTN, fg=DARK_FG,
+            activebackground="#454545", activeforeground=DARK_FG,
+            relief="flat", padx=10, pady=4)
+        self.version_menu = tk.Menu(self.version_menubutton, tearoff=0,
+                                     bg=DARK_BTN, fg=DARK_FG)
+        self.version_menubutton.config(menu=self.version_menu)
 
         self.canvas = tk.Canvas(root, width=self.CANVAS_W, height=self.CANVAS_H,
                                 bg=DARK_BG, highlightthickness=0)
@@ -4140,6 +4392,7 @@ class MediaViewer:
         self._fmff_buffer = None
         self.playback_fps = 60
         self.fps_var.set(f"{self.playback_fps} fps")
+        self._update_version_menu([], 0)
         ext = Path(path).suffix.lower()
         self.current_source_path = str(path)
         self.current_is_fmff = (ext == ".fmff")
@@ -4180,7 +4433,46 @@ class MediaViewer:
         elif d.is_animated:
             self._load_fmff_animated(d)
         else:
+            self._update_version_menu(d.list_versions(), 0)
             self._load_fmff_image(d)
+
+    def _update_version_menu(self, versions, current_index):
+        """Shows the toolbar's version switcher (see run()'s Menubutton)
+        when the file just opened actually has more than one version to
+        switch between (see FMFFDecoder.list_versions -- a plain still
+        image that add_version was never run on always reports exactly
+        one, "original"), otherwise hides it. Called with [] to hide it
+        outright for every content type that doesn't support versions at
+        all (video/audio/document/animated -- see list_versions) and at
+        the top of open_path so switching to a different file doesn't
+        leave a previous file's version menu showing."""
+        self._fmff_versions = versions
+        self._fmff_current_version = current_index
+        self.version_menu.delete(0, "end")
+        if len(versions) <= 1:
+            self.version_menubutton.pack_forget()
+            return
+        for v in versions:
+            label = v["name"] if v["index"] != current_index else f"✓ {v['name']}"
+            self.version_menu.add_command(
+                label=label, command=lambda i=v["index"]: self._switch_fmff_version(i))
+        current_name = next((v["name"] for v in versions if v["index"] == current_index),
+                             str(current_index))
+        self.version_var.set(f"Version: {current_name}")
+        self.version_menubutton.pack(side="left", padx=4, pady=4)
+
+    def _switch_fmff_version(self, index):
+        if not self.current_is_fmff or not self.current_source_path:
+            return
+        try:
+            d = FMFFDecoder(self.current_source_path)
+        except Exception as exc:
+            self.set_status(f"failed to switch version: {exc}")
+            return
+        self._cancel_background()
+        self.set_status(f"decoding version {index}...")
+        self._load_fmff_image(d, version=index)
+        self._update_version_menu(d.list_versions(), index)
 
     def _load_fmff_document(self, d):
         """An .fmff document (see FMFFEncoder.encode_document): the
@@ -4229,7 +4521,7 @@ class MediaViewer:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _load_fmff_image(self, d):
+    def _load_fmff_image(self, d, version=0):
         # Decode fully in the background, but only show the finished image --
         # no visible tile-by-tile fill-in. The thumbnail is still decoded as
         # the compositing base (so partial tiles land on something sane) but
@@ -4262,7 +4554,7 @@ class MediaViewer:
                 self.q.put(("fmff_tile", (entry, y0, x0, decoded)))
                 if self.simulate_slow:
                     time.sleep(self.simulate_slow)
-            result_img = d.full(progress_cb=on_tile)
+            result_img = d.full(progress_cb=on_tile, version=version)
             if not stop_event.is_set():
                 self.q.put(("fmff_done", result_img))
 
@@ -5511,8 +5803,9 @@ def cmd_info(args):
         lossless = sum(1 for e in color_entries if e.mode == MODE_LOSSLESS)
         lossy = sum(1 for e in color_entries if e.mode == MODE_LOSSY)
         palette = sum(1 for e in color_entries if e.mode == MODE_PALETTE)
+        raw = sum(1 for e in color_entries if e.mode == MODE_RAW)
         noun = "regions" if not dec.has_fixed_tile_grid else "tiles"
-        print(f"color {noun}: {lossless} lossless, {lossy} lossy, {palette} palette"
+        print(f"color {noun}: {lossless} lossless, {lossy} lossy, {palette} palette, {raw} raw"
               f"{' (summed across all frames)' if dec.frame_count > 1 else ''}")
     if dec.tags:
         tag_str = ", ".join(f"{k}={v}" for k, v in dec.tags.items())
@@ -5601,6 +5894,11 @@ def cmd_doctor(args):
                                 "recovering the PDF's own bytes needs nothing here)"),
         ("tkinterdnd2", "tkinterdnd2", "viewer only -- drag-and-drop (Open/Batch... "
                                         "buttons work without it)"),
+        ("zstandard", "zstandard", "images only -- a 3rd, usually-smaller-and-faster-than-"
+                                    "zlib candidate in the tile compression race (falls back "
+                                    "to zlib/bz2 alone without it -- still correct, just "
+                                    "slightly bigger on average). A file already encoded with "
+                                    "it needs this installed to decode those specific tiles."),
     ):
         try:
             __import__(module)
