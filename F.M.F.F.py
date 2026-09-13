@@ -5645,6 +5645,112 @@ def _hide_console_window():
         ctypes.windll.user32.ShowWindow(hwnd, SW_HIDE)
 
 
+_JOB_HANDLE = None  # kept alive for the process's whole lifetime, see below
+
+
+def _setup_worker_job_object():
+    """Ties every _get_tile_pool worker's life to this process's, so a
+    hard crash or a Task-Manager "End task" on the main .exe can never
+    leave orphaned worker processes running forever in the background
+    (each one just sits idle waiting on the pool's task queue, so it
+    doesn't show up as CPU usage -- only as unexplained extra
+    F.M.F.F.exe entries and memory that never comes back).
+
+    A normal exit doesn't need this: _shutdown_tile_pool already runs
+    via atexit and terminates every worker cleanly. atexit only fires on
+    a normal interpreter shutdown, though -- not on a forceful kill or a
+    native-level crash (e.g. inside an image/video C extension), which
+    is exactly when orphans were happening.
+
+    The fix is a Windows Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE:
+    this process is assigned to the job *before* any worker exists, and
+    Windows automatically makes every child process created afterwards
+    (each pool worker) a member of the same job too. Whenever the job's
+    last open handle is closed -- which Windows does on its own the
+    moment this process ends, however it ends -- every remaining member
+    process is killed with it. The handle is stashed in the module-level
+    _JOB_HANDLE precisely so nothing closes it early: closing it before
+    the process exits would trigger that same kill immediately.
+
+    Windows-only, and best-effort -- e.g. a host that already placed
+    this process in a job without nested-job support (pre-Windows-8,
+    or some sandboxes) will fail the assignment, in which case this
+    quietly does nothing rather than treating it as fatal."""
+    if os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    global _JOB_HANDLE
+    try:
+        kernel32 = ctypes.windll.kernel32
+
+        class _BASIC_LIMIT(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _IO_COUNTERS(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_uint64) for name in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+        class _EXTENDED_LIMIT(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BASIC_LIMIT),
+                ("IoInfo", _IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+        JobObjectExtendedLimitInformation = 9
+
+        # ctypes assumes a 32-bit int return by default, which truncates
+        # HANDLE (a pointer, 64-bit on x64) -- silently turning a
+        # perfectly valid handle into something that reads as falsy, so
+        # every call here needs its real Windows signature spelled out.
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return
+
+        info = _EXTENDED_LIMIT()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+                job, JobObjectExtendedLimitInformation,
+                ctypes.byref(info), ctypes.sizeof(info)):
+            kernel32.CloseHandle(job)
+            return
+
+        if not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
+            kernel32.CloseHandle(job)
+            return
+
+        _JOB_HANDLE = job  # deliberately never closed -- see docstring
+    except OSError:
+        pass
+
+
 if __name__ == "__main__":
     # Must be the very first thing that runs, before anything else --
     # including argument parsing -- when this has been frozen into a
@@ -5663,6 +5769,11 @@ if __name__ == "__main__":
     # "__main__":` in a one-off test script, not this file) -- so this
     # is not a hypothetical to skip.
     mp.freeze_support()
+    # Must happen before the first _get_tile_pool() call (anywhere inside
+    # main()) so every pool worker it spawns is already a child of a
+    # job-assigned process and inherits membership automatically -- see
+    # _setup_worker_job_object's docstring for why this exists at all.
+    _setup_worker_job_object()
     # A Windows console's own encoding (cp1252, or another single-byte
     # codepage depending on locale) is what sys.stdout/stderr default to
     # here -- not UTF-8 -- so printing a path with non-Latin-1 characters

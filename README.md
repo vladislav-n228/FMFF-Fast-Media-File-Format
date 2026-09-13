@@ -732,6 +732,31 @@ this file, a one-off test script missing its own `__main__` guard)
 already caused once during development, so it's called out here as a
 "don't remove this line" rather than a hypothetical.
 
+**Worker processes can't outlive a crash any more, either.** Tile-pool
+workers used to be cleaned up only via `atexit` (`_shutdown_tile_pool`),
+which runs on a normal exit but not when the process is killed outright
+-- Task Manager's "End task", a hard crash inside an image/video C
+extension, anything that skips Python's own shutdown sequence. Each
+worker just sits idle waiting on the pool's task queue forever in that
+case: no CPU usage, so it's easy to miss, but every one of them is
+memory that never comes back, and Task Manager can't group an orphan
+under the app it no longer has any relationship to -- which is exactly
+what showed up as several ungrouped, unexplained `F.M.F.F.exe` entries
+after a crash, alongside the correctly-grouped, still-running instance.
+The app now assigns itself to a Windows Job Object with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (`_setup_worker_job_object`) before
+any pool can exist; Windows automatically makes every process launched
+afterwards -- each pool worker included -- a member of that same job,
+and tears down every member the moment the job's one handle is closed,
+which Windows does on its own as soon as this process ends, no matter
+how. Confirmed by force-killing the main process mid-encode with 8
+active workers: before this, all 8 kept running indefinitely; after,
+`taskkill /F` on the main process took every worker down with it.
+Windows-only and best-effort -- a host that already placed this process
+in a job without nested-job support (older than Windows 8, some
+sandboxes) fails the assignment silently rather than crashing the app,
+since a normal exit was already covered by `atexit` regardless.
+
 Double-clicking the `.exe` with no arguments opens the GUI viewer, same
 as `view` with no file; the console window that a plain console-
 subsystem build would otherwise show for that hides itself immediately
