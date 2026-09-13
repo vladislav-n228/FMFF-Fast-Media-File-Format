@@ -3987,6 +3987,15 @@ class BatchConvertWindow:
 
     # -- queueing -----------------------------------------------------------
 
+    def _refocus(self):
+        """Windows' focus-stealing prevention can leave this Toplevel
+        looking backgrounded/minimized once a native file dialog closes,
+        even with the dialog's own parent= set correctly -- pull it back
+        to the front explicitly rather than leaving that to chance."""
+        self.top.deiconify()
+        self.top.lift()
+        self.top.focus_force()
+
     def _add_path(self, path):
         if os.path.isdir(path):
             for root_dir, _dirs, files in os.walk(path):
@@ -4010,7 +4019,11 @@ class BatchConvertWindow:
         self._update_summary()
 
     def add_files(self):
-        paths = filedialog.askopenfilenames(filetypes=[
+        # parent=self.top, not the default root -- otherwise Windows
+        # associates the native file-picker with the wrong window, and
+        # this Toplevel doesn't reliably get focus back (can even end up
+        # minimized) once the picker closes.
+        paths = filedialog.askopenfilenames(parent=self.top, filetypes=[
             ("Images, video, audio, and documents",
                 "*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tiff *.tif *.ico "
                 "*.mp4 *.avi *.mov *.mkv *.webm *.m4v "
@@ -4018,11 +4031,13 @@ class BatchConvertWindow:
                 "*.pdf *.txt"),
             ("All files", "*.*"),
         ])
+        self._refocus()
         for p in paths:
             self._add_file(p)
 
     def add_folder(self):
-        d = filedialog.askdirectory()
+        d = filedialog.askdirectory(parent=self.top)
+        self._refocus()
         if d:
             self._add_path(d)
 
@@ -4178,7 +4193,8 @@ class MediaViewer:
         toolbar = tk.Frame(root, bg=DARK_PANEL)
         toolbar.pack(fill="x")
         for text, cmd in (("Open", self.on_open), ("Screenshot", self.on_screenshot),
-                          ("Save as...", self.on_save), ("Batch...", self.on_batch)):
+                          ("Save as...", self.on_save), ("Batch...", self.on_batch),
+                          ("Glue...", self.on_glue)):
             tk.Button(toolbar, text=text, command=cmd, bg=DARK_BTN, fg=DARK_FG,
                       activebackground="#454545", activeforeground=DARK_FG,
                       relief="flat", padx=10, pady=4).pack(side="left", padx=4, pady=4)
@@ -4366,6 +4382,9 @@ class MediaViewer:
 
     def on_batch(self):
         BatchConvertWindow(self.root)
+
+    def on_glue(self):
+        GlueWindow(self.root)
 
     def on_drop(self, event):
         paths = [p for p in self.root.tk.splitlist(event.data) if p]
@@ -4616,9 +4635,30 @@ class MediaViewer:
         # actually re-encoded). This is a disposable playback-only copy;
         # the .fmff file itself keeps its original Opus audio exactly as
         # encoded (Save as... / decode still gets that, not this AAC copy).
+        # blob_path itself is a streaming-style fragmented MP4 (FFmpeg's
+        # frag_keyframe+empty_moov output, written segment by segment as
+        # it's decoded -- see the module docstring's "Container layout
+        # for a video" section): its moov carries no duration and there's
+        # no sidx, since nothing knew the total length up front. Lightweight
+        # players -- Windows' own Movies & TV app included -- read only
+        # that header, so handed this file directly they show a dead,
+        # duration-less seek bar even though the video plays fine start to
+        # finish. Remuxing once (-c copy, no re-encode) into a normal
+        # finalized MP4 is what actually fixes that, by writing a real moov
+        # with the full duration once FFmpeg has seen every frame -- same
+        # fix `_save_video`'s .mp4 export already relies on. This is kept
+        # as its own remux, tried even if the AAC step below fails, so a
+        # seek bar that works stays independent of Opus/AAC compatibility.
         play_path = blob_path
         ffmpeg = _find_ffmpeg()
         if ffmpeg is not None:
+            flat_path = os.path.join(tmp_dir, "video_flat.mp4")
+            result = subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                                      "-i", blob_path, "-c", "copy", flat_path],
+                                     check=False, stderr=subprocess.DEVNULL)
+            if result.returncode == 0 and os.path.exists(flat_path):
+                play_path = flat_path
+
             aac_path = os.path.join(tmp_dir, "video_playback.mp4")
             result = subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
                                       "-i", blob_path, "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
@@ -4633,7 +4673,9 @@ class MediaViewer:
         # counts, not just a stylistic difference. Falls back to that
         # in-window loop only if launching the default player fails
         # outright (e.g. nothing associated with .mp4 at all).
-        self.set_status(f"playing in the system's default player{corrupt_note}")
+        degraded_note = "" if play_path is not blob_path else \
+            " -- no ffmpeg found, so the seek bar/duration may not work right"
+        self.set_status(f"playing in the system's default player{corrupt_note}{degraded_note}")
         try:
             _open_with_default_player(play_path)
             return
@@ -5093,27 +5135,34 @@ def _save_video(source_path, is_fmff, fps, path, dest_ext, progress_cb):
     elif dest_ext in VIDEO_EXTS:
         if is_fmff:
             dec = FMFFDecoder(source_path)
-            # See cmd_decode's identical .mp4-with-tags handling: the raw
-            # extracted stream never had the source's tags muxed in (they
-            # live in FMFF's own metadata blob, not the AV1/Opus stream),
-            # so restoring them needs an FFmpeg remux even for .mp4.
-            if dest_ext == ".mp4" and not dec.tags:
-                dec.extract_media(path)
-            else:
-                ffmpeg = _find_ffmpeg()
-                if ffmpeg is None:
-                    raise _ffmpeg_missing_error("saving to this format")
-                with tempfile.TemporaryDirectory(prefix="fmff_save_") as tmp:
-                    blob_path = os.path.join(tmp, "video.mp4")
-                    dec.extract_media(blob_path)
-                    # -map 0 (every stream in the input), not FFmpeg's
-                    # default "best of each type" auto-selection -- a
-                    # video .fmff can carry several audio/subtitle tracks
-                    # (see encode_video), and -c copy alone would silently
-                    # drop every one but the first of each type otherwise.
-                    subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                                     "-i", blob_path, "-map", "0", "-c", "copy",
-                                     *_ffmpeg_metadata_args(dec.tags), path], check=True)
+            ffmpeg = _find_ffmpeg()
+            if ffmpeg is None:
+                raise _ffmpeg_missing_error("saving to this format")
+            with tempfile.TemporaryDirectory(prefix="fmff_save_") as tmp:
+                blob_path = os.path.join(tmp, "video.mp4")
+                dec.extract_media(blob_path)
+                # -map 0 (every stream in the input), not FFmpeg's
+                # default "best of each type" auto-selection -- a
+                # video .fmff can carry several audio/subtitle tracks
+                # (see encode_video), and -c copy alone would silently
+                # drop every one but the first of each type otherwise.
+                #
+                # MP4-family containers (.mp4/.mov/.m4v) go through the
+                # same Windows Media Foundation pipeline playback does
+                # (see _load_fmff_video's identical fix) -- and that
+                # pipeline doesn't reliably decode Opus even inside a
+                # container it otherwise supports fine, so a straight
+                # -c copy here produces a file that plays video with no
+                # sound. "-c copy" then "-c:a aac" overrides just the
+                # audio codec (video still stream-copied, so this stays
+                # fast); .webm/.mkv keep Opus untouched since it's WebM's
+                # own native audio codec, well supported wherever either
+                # format is used at all.
+                audio_args = ["-c", "copy", "-c:a", "aac", "-b:a", "192k"] \
+                    if dest_ext in (".mp4", ".mov", ".m4v") else ["-c", "copy"]
+                subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                                 "-i", blob_path, "-map", "0", *audio_args,
+                                 *_ffmpeg_metadata_args(dec.tags), path], check=True)
             progress_cb(100)
         else:
             shutil.copyfile(source_path, path)
@@ -5141,21 +5190,32 @@ def _save_audio(source_path, is_fmff, path, dest_ext, progress_cb):
     elif dest_ext in AUDIO_EXTS or dest_ext == ".mp4":
         if is_fmff:
             dec = FMFFDecoder(source_path)
-            if dest_ext == ".mp4" and not dec.tags:
-                dec.extract_media(path)
-            else:
-                ffmpeg = _find_ffmpeg()
-                if ffmpeg is None:
-                    raise _ffmpeg_missing_error("saving to this format")
-                with tempfile.TemporaryDirectory(prefix="fmff_save_") as tmp:
-                    blob_path = os.path.join(tmp, "audio.mp4")
-                    dec.extract_media(blob_path)
-                    # See cmd_decode's identical fallback for why: -c:a copy
-                    # works only where the container can hold Opus verbatim
-                    # (.opus/.ogg/.m4a); anything else (.mp3/.wav/.flac/...)
-                    # needs an actual transcode. Either way the source's own
-                    # tags (see encode_audio) are restored here too.
-                    meta_args = _ffmpeg_metadata_args(dec.tags)
+            ffmpeg = _find_ffmpeg()
+            if ffmpeg is None:
+                raise _ffmpeg_missing_error("saving to this format")
+            with tempfile.TemporaryDirectory(prefix="fmff_save_") as tmp:
+                blob_path = os.path.join(tmp, "audio.mp4")
+                dec.extract_media(blob_path)
+                # See cmd_decode's identical fallback for why: -c:a copy
+                # works only where the container can hold Opus verbatim
+                # AND the player actually decodes Opus once it's there.
+                # .opus/.ogg (Opus's own native container) genuinely
+                # qualify; .mp4/.m4a can hold the bytes just as legally,
+                # but Windows' Media Foundation pipeline doesn't reliably
+                # decode Opus out of an MP4-family container even though
+                # FFmpeg will happily mux it in -- see _save_video's
+                # identical MP4-family note -- so those two are forced
+                # through an actual AAC transcode instead of tried as a
+                # copy first. Everything else (.mp3/.wav/.flac/...) can't
+                # hold Opus at all, so -c:a copy fails outright there and
+                # falls back to a real transcode. Either way the source's
+                # own tags (see encode_audio) are restored here too.
+                meta_args = _ffmpeg_metadata_args(dec.tags)
+                if dest_ext in (".mp4", ".m4a"):
+                    subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                                     "-i", blob_path, "-c:a", "aac", "-b:a", "192k",
+                                     *meta_args, path], check=True)
+                else:
                     try:
                         subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
                                          "-i", blob_path, "-c:a", "copy",
@@ -5194,6 +5254,267 @@ def _save_document(source_path, is_fmff, path, dest_ext, progress_cb):
     else:
         raise ValueError(f"can't save a document as {dest_ext or '(no extension)'}")
     progress_cb(100)
+
+
+def _glue_media(paths, output_path, progress_cb=None, cancel_event=None):
+    """Concatenate several .fmff video files (or several .fmff audio
+    files -- not a mix of both) into one new .fmff, in the given order.
+    Each input is unpacked back to its embedded fragmented MP4 (see
+    extract_media), joined with FFmpeg's concat demuxer, then the result
+    is fed through encode_video/encode_audio exactly like any other
+    source file -- so the glued output ends up freshly re-encoded (AV1 +
+    Opus) rather than a raw stream-copy splice, which is what actually
+    smooths over the timestamp discontinuities a concat demuxer join
+    leaves behind. Requires every clip to already share the same
+    resolution (video) or sample rate/channel layout (audio): FFmpeg's
+    concat demuxer doesn't itself refuse a mismatch, it just hands back
+    a file that glitches or fails to play, so this checks first instead
+    of producing that silently. Returns "video" or "audio"."""
+    if len(paths) < 2:
+        raise ValueError("need at least 2 files to glue")
+
+    decs = [FMFFDecoder(p) for p in paths]
+    for p, dec in zip(paths, decs):
+        if not (dec.is_video or dec.is_audio):
+            raise ValueError(f"{Path(p).name} is not a video or audio .fmff file")
+
+    kinds = {"video" if dec.is_video else "audio" for dec in decs}
+    if len(kinds) > 1:
+        raise ValueError("can't glue video and audio files together -- pick all video or all audio")
+    kind = kinds.pop()
+
+    if kind == "video":
+        resolutions = {(dec.width, dec.height) for dec in decs}
+        if len(resolutions) > 1:
+            raise ValueError(
+                "these videos have different resolutions (" +
+                ", ".join(f"{w}x{h}" for w, h in sorted(resolutions)) +
+                ") -- glue only supports clips that already match")
+    else:
+        layouts = {(dec.sample_rate, dec.channels) for dec in decs}
+        if len(layouts) > 1:
+            raise ValueError(
+                "these audio files have different sample rate/channel layouts -- "
+                "glue only supports clips that already match")
+
+    ffmpeg = _find_ffmpeg()
+    if ffmpeg is None:
+        raise _ffmpeg_missing_error("gluing files")
+
+    def report(percent):
+        if progress_cb:
+            progress_cb(percent)
+
+    with tempfile.TemporaryDirectory(prefix="fmff_glue_") as tmp:
+        list_path = os.path.join(tmp, "concat.txt")
+        with open(list_path, "w", encoding="utf-8") as f:
+            for i, dec in enumerate(decs):
+                report(int(i * 40 / len(decs)))
+                part_path = os.path.join(tmp, f"part{i}.mp4")
+                dec.extract_media(part_path)
+                f.write("file '{}'\n".format(part_path.replace("'", "'\\''")))
+
+        merged_path = os.path.join(tmp, "merged.mp4")
+        subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                         "-f", "concat", "-safe", "0", "-i", list_path,
+                         "-c", "copy", merged_path], check=True)
+        report(50)
+
+        enc = FMFFEncoder()
+        if kind == "video":
+            def enc_cb(i, total):
+                if total:
+                    report(50 + int(i * 50 / total))
+            enc.encode_video(merged_path, output_path, progress_cb=enc_cb, cancel_event=cancel_event)
+        else:
+            enc.encode_audio(merged_path, output_path, cancel_event=cancel_event)
+            report(90)
+
+    report(100)
+    return kind
+
+
+class GlueWindow:
+    """Pick any number of .fmff video files (or .fmff audio files),
+    individually or by whole folder, put them in order, and concatenate
+    them into one new .fmff via _glue_media -- the "Glue..." toolbar
+    button's window."""
+
+    def __init__(self, parent_root):
+        self.top = tk.Toplevel(parent_root)
+        self.top.title("Glue .fmff files")
+        self.top.configure(bg=DARK_BG)
+        self.top.geometry("560x420")
+
+        toolbar = tk.Frame(self.top, bg=DARK_PANEL)
+        toolbar.pack(fill="x")
+        for text, cmd in (("Add Files...", self.add_files), ("Add Folder...", self.add_folder),
+                          ("Remove", self.remove_selected), ("Move Up", self.move_up),
+                          ("Move Down", self.move_down), ("Clear", self.clear)):
+            tk.Button(toolbar, text=text, command=cmd, bg=DARK_BTN, fg=DARK_FG,
+                      activebackground="#454545", activeforeground=DARK_FG,
+                      relief="flat", padx=8, pady=4).pack(side="left", padx=3, pady=4)
+
+        self.listbox = tk.Listbox(self.top, bg=DARK_PANEL, fg=DARK_FG,
+                                   selectbackground="#3a6ea5", selectforeground=DARK_FG,
+                                   activestyle="none", highlightthickness=0, relief="flat")
+        self.listbox.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        bottom = tk.Frame(self.top, bg=DARK_PANEL)
+        bottom.pack(fill="x")
+        self.status = tk.Label(bottom, text="add .fmff video files (or audio files) to glue, in order",
+                                anchor="w", bg=DARK_PANEL, fg=DARK_FG)
+        self.status.pack(side="left", fill="x", expand=True, padx=6, pady=4)
+        self.glue_btn = tk.Button(bottom, text="Glue...", command=self._on_glue_stop,
+                                   bg="#2d5f3d", fg=DARK_FG, activebackground="#3a7a4f",
+                                   activeforeground=DARK_FG, relief="flat", padx=14, pady=4)
+        self.glue_btn.pack(side="right", padx=6, pady=4)
+
+        self.paths = []
+        self.q = queue.Queue()
+        self._running = False
+        self._closed = False
+        self.stop_event = threading.Event()
+        self.top.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.top.after(80, self._poll)
+
+    # -- queueing -------------------------------------------------------
+
+    def _refocus(self):
+        """Windows' focus-stealing prevention can leave this Toplevel
+        looking backgrounded/minimized once a native file dialog closes,
+        even with the dialog's own parent= set correctly -- pull it back
+        to the front explicitly rather than leaving that to chance."""
+        self.top.deiconify()
+        self.top.lift()
+        self.top.focus_force()
+
+    def _add_path(self, path):
+        if self._running or path in self.paths or Path(path).suffix.lower() != ".fmff":
+            return
+        self.paths.append(path)
+        self.listbox.insert("end", Path(path).name)
+
+    def add_files(self):
+        # parent=self.top, not the default root -- otherwise Windows
+        # associates the native file-picker with the wrong window, and
+        # this Toplevel doesn't reliably get focus back (can even end up
+        # minimized) once the picker closes.
+        paths = filedialog.askopenfilenames(parent=self.top,
+                                             filetypes=[("FMFF", "*.fmff"), ("All files", "*.*")])
+        self._refocus()
+        for p in paths:
+            self._add_path(p)
+
+    def add_folder(self):
+        d = filedialog.askdirectory(parent=self.top)
+        self._refocus()
+        if not d:
+            return
+        for name in sorted(os.listdir(d)):
+            if Path(name).suffix.lower() == ".fmff":
+                self._add_path(os.path.join(d, name))
+
+    def remove_selected(self):
+        if self._running:
+            return
+        for i in reversed(self.listbox.curselection()):
+            del self.paths[i]
+            self.listbox.delete(i)
+
+    def move_up(self):
+        if self._running:
+            return
+        for i in self.listbox.curselection():
+            if i == 0:
+                continue
+            self.paths[i - 1], self.paths[i] = self.paths[i], self.paths[i - 1]
+            text = self.listbox.get(i)
+            self.listbox.delete(i)
+            self.listbox.insert(i - 1, text)
+            self.listbox.selection_set(i - 1)
+
+    def move_down(self):
+        if self._running:
+            return
+        for i in reversed(self.listbox.curselection()):
+            if i >= len(self.paths) - 1:
+                continue
+            self.paths[i + 1], self.paths[i] = self.paths[i], self.paths[i + 1]
+            text = self.listbox.get(i)
+            self.listbox.delete(i)
+            self.listbox.insert(i + 1, text)
+            self.listbox.selection_set(i + 1)
+
+    def clear(self):
+        if self._running:
+            return
+        self.paths.clear()
+        self.listbox.delete(0, "end")
+
+    # -- gluing -----------------------------------------------------------
+
+    def _on_glue_stop(self):
+        if self._running:
+            self.stop_event.set()
+            self.status.config(text="cancelling...")
+            return
+        if len(self.paths) < 2:
+            self.status.config(text="add at least 2 .fmff files first")
+            return
+        out_path = filedialog.asksaveasfilename(parent=self.top, defaultextension=".fmff",
+                                                  filetypes=[("FMFF", "*.fmff")])
+        self._refocus()
+        if not out_path:
+            return
+        self._running = True
+        self.stop_event.clear()
+        self.glue_btn.config(text="Cancel", bg="#7a2d2d", activebackground="#a53a3a")
+        self.status.config(text="gluing...")
+        threading.Thread(target=self._worker, args=(list(self.paths), out_path), daemon=True).start()
+
+    def _worker(self, paths, out_path):
+        def progress_cb(percent):
+            self.q.put(("progress", percent))
+        try:
+            kind = _glue_media(paths, out_path, progress_cb=progress_cb, cancel_event=self.stop_event)
+            self.q.put(("done", (kind, len(paths), out_path)))
+        except EncodingCancelled:
+            self.q.put(("cancelled", None))
+        except Exception as exc:
+            self.q.put(("error", str(exc)))
+
+    def _reset_glue_btn(self):
+        self._running = False
+        self.glue_btn.config(text="Glue...", bg="#2d5f3d", activebackground="#3a7a4f")
+
+    def _poll(self):
+        if self._closed:
+            return
+        try:
+            while True:
+                kind, payload = self.q.get_nowait()
+                if kind == "progress":
+                    pct = f" ({payload}%)" if payload is not None else ""
+                    self.status.config(text=f"gluing...{pct}")
+                elif kind == "done":
+                    media_kind, n, out_path = payload
+                    self.status.config(text=f"glued {n} {media_kind} file(s) -> {out_path}")
+                    self._reset_glue_btn()
+                elif kind == "cancelled":
+                    self.status.config(text="cancelled")
+                    self._reset_glue_btn()
+                elif kind == "error":
+                    self.status.config(text=f"glue failed: {payload}")
+                    self._reset_glue_btn()
+        except queue.Empty:
+            pass
+        self.top.after(80, self._poll)
+
+    def on_close(self):
+        self._closed = True
+        self.stop_event.set()
+        self.top.destroy()
 
 
 # ------------------------------------------------------------------------ CLI
@@ -5425,35 +5746,49 @@ def cmd_decode(args):
         return
 
     if dec.is_video:
-        # The .mp4 fast path skips FFmpeg entirely (extract_media() alone
-        # is already a valid, playable file) -- but that raw fragmented
-        # blob never had the source's tags muxed into it to begin with
-        # (they're carried separately, in FMFF's own metadata blob, not
-        # inside the AV1/Opus stream -- see encode_video), so restoring
-        # them means an FFmpeg remux even for a .mp4 output, same as any
-        # other extension.
-        if out_ext == ".mp4" and not dec.tags:
-            dec.extract_media(args.output)
-        elif out_ext in VIDEO_EXTS or (out_ext == ".mp4" and dec.tags):
+        if out_ext in VIDEO_EXTS:
             ffmpeg = _find_ffmpeg()
             if ffmpeg is None:
-                raise SystemExit(_ffmpeg_missing_message("writing this format") +
-                                  "\n(or pass a .mp4 output to just extract the reconstructed "
-                                  "stream directly, no FFmpeg needed)")
-            with tempfile.TemporaryDirectory(prefix="fmff_dec_") as tmp:
-                blob_path = os.path.join(tmp, "video.mp4")
-                dec.extract_media(blob_path)
-                # -map 0 (every stream in the input), not FFmpeg's default
-                # "best of each type" auto-selection -- a video .fmff can
-                # carry several audio/subtitle tracks (see encode_video),
-                # and -c copy alone would silently drop every one but the
-                # first of each type otherwise (confirmed directly: a
-                # real 2-audio/2-subtitle source came out of this remux
-                # with only 1 audio track and no subtitles at all before
-                # -map 0 was added here).
-                subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                                 "-i", blob_path, "-map", "0", "-c", "copy",
-                                 *_ffmpeg_metadata_args(dec.tags), args.output], check=True)
+                if out_ext == ".mp4":
+                    # extract_media() alone is already a valid, playable
+                    # file -- degrade to that rather than hard-failing
+                    # just because FFmpeg is missing, but say so: it
+                    # skips the tags restore below, and (see the "-c
+                    # copy" branch's comment a few lines down) its Opus
+                    # audio track won't reliably decode in every player,
+                    # Windows' own included.
+                    dec.extract_media(args.output)
+                    print("  note: no FFmpeg found -- wrote the raw reconstructed stream "
+                          "as-is (tags not restored, and its Opus audio track may not play "
+                          "in every player -- notably Windows' own)")
+                else:
+                    raise SystemExit(_ffmpeg_missing_message("writing this format") +
+                                      "\n(or pass a .mp4 output to just extract the reconstructed "
+                                      "stream directly, no FFmpeg needed)")
+            else:
+                with tempfile.TemporaryDirectory(prefix="fmff_dec_") as tmp:
+                    blob_path = os.path.join(tmp, "video.mp4")
+                    dec.extract_media(blob_path)
+                    # -map 0 (every stream in the input), not FFmpeg's default
+                    # "best of each type" auto-selection -- a video .fmff can
+                    # carry several audio/subtitle tracks (see encode_video),
+                    # and -c copy alone would silently drop every one but the
+                    # first of each type otherwise (confirmed directly: a
+                    # real 2-audio/2-subtitle source came out of this remux
+                    # with only 1 audio track and no subtitles at all before
+                    # -map 0 was added here).
+                    #
+                    # MP4-family containers (.mp4/.mov/.m4v) additionally
+                    # need their audio forced to AAC -- see _save_video's
+                    # identical note: Windows' Media Foundation pipeline
+                    # doesn't reliably decode Opus out of one even though
+                    # FFmpeg will happily mux it in, so a plain -c copy
+                    # here would produce a file that plays with no sound.
+                    audio_args = ["-c", "copy", "-c:a", "aac", "-b:a", "192k"] \
+                        if out_ext in (".mp4", ".mov", ".m4v") else ["-c", "copy"]
+                    subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                                     "-i", blob_path, "-map", "0", *audio_args,
+                                     *_ffmpeg_metadata_args(dec.tags), args.output], check=True)
         else:
             dec.thumbnail().save(args.output)
             print(f"decoded poster frame of {args.input} -> {args.output} "
@@ -5480,8 +5815,10 @@ def cmd_decode(args):
                 print(f"  note: this video has an alpha track that was NOT extracted -- "
                       f"{args.output} has no transparency; pass --alpha-output PATH to get it")
     elif dec.is_audio:
-        if out_ext == ".mp4" and not dec.tags:
+        if out_ext == ".mp4" and not dec.tags and _find_ffmpeg() is None:
             dec.extract_media(args.output)
+            print("  note: no FFmpeg found -- wrote the raw reconstructed Opus stream "
+                  "as-is, which may not play in every player -- notably Windows' own")
         else:
             ffmpeg = _find_ffmpeg()
             if ffmpeg is None:
@@ -5491,22 +5828,35 @@ def cmd_decode(args):
             with tempfile.TemporaryDirectory(prefix="fmff_dec_") as tmp:
                 blob_path = os.path.join(tmp, "audio.mp4")
                 dec.extract_media(blob_path)
-                # -c:a copy where the container allows keeping Opus as-is
-                # (.m4a, .opus/.ogg); anything else (.mp3, .wav, .flac, ...)
-                # needs FFmpeg to actually transcode, since those containers
-                # can't hold an Opus stream verbatim -- letting FFmpeg pick
-                # the codec for out_ext's default rather than forcing one.
-                # Either way the source's own tags (see encode_audio) are
-                # restored here too -- they never made it into the Opus
-                # stream itself, only into FMFF's own metadata blob.
+                # -c:a copy works only where the container can hold Opus
+                # verbatim AND the player actually decodes Opus once it's
+                # there. .opus/.ogg (Opus's own native container)
+                # genuinely qualify; .mp4/.m4a can hold the bytes just as
+                # legally, but Windows' Media Foundation pipeline doesn't
+                # reliably decode Opus out of an MP4-family container even
+                # though FFmpeg will happily mux it in -- see _save_video's
+                # identical MP4-family note -- so those two are forced
+                # through an actual AAC transcode instead of tried as a
+                # copy first. Everything else (.mp3, .wav, .flac, ...)
+                # can't hold Opus at all, so -c:a copy fails outright there
+                # and falls back to a real transcode (FFmpeg picks the
+                # codec for out_ext's default). Either way the source's
+                # own tags (see encode_audio) are restored here too --
+                # they never made it into the Opus stream itself, only
+                # into FMFF's own metadata blob.
                 meta_args = _ffmpeg_metadata_args(dec.tags)
-                try:
+                if out_ext in (".mp4", ".m4a"):
                     subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                                     "-i", blob_path, "-c:a", "copy",
+                                     "-i", blob_path, "-c:a", "aac", "-b:a", "192k",
                                      *meta_args, args.output], check=True)
-                except subprocess.CalledProcessError:
-                    subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                                     "-i", blob_path, *meta_args, args.output], check=True)
+                else:
+                    try:
+                        subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                                         "-i", blob_path, "-c:a", "copy",
+                                         *meta_args, args.output], check=True)
+                    except subprocess.CalledProcessError:
+                        subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                                         "-i", blob_path, *meta_args, args.output], check=True)
         print(f"decoded {args.input} -> {args.output} "
               f"({dec.duration_ms / 1000:.1f}s, {dec.sample_rate} Hz, {dec.channels}ch)")
         if dec.last_corrupt_segments:

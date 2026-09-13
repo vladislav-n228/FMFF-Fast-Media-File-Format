@@ -515,6 +515,39 @@ re-encoded) before handing the file to the default player -- the stored
 `.fmff` keeps its original Opus audio either way, this is a disposable
 playback-only copy.
 
+A related but separate problem showed up specifically in Windows'
+Photos/Movies & TV app: even with the AAC audio fix above in place, the
+seek bar stayed dead and no real duration showed. The file
+`extract_media()` reconstructs is FFmpeg's own *streaming-style*
+fragmented MP4 (`frag_keyframe+empty_moov` -- written segment by
+segment as it's decoded, so nothing ever knew the total length up
+front): its `moov` box carries no duration and there's no `sidx`
+index either, which is exactly what a lightweight player reads to
+populate a seek bar. FFmpeg itself can still work out the real
+duration by scanning the whole file, but Windows' own player doesn't
+bother -- confirmed directly by inspecting the box layout of the raw
+extracted file (`moov` before `mdat`, `moof` boxes present, no
+duration in the header) versus the same file after one more `-c copy`
+remux (`moov` after `mdat`, no `moof`, real duration in the header).
+That extra remux -- no re-encode, just a container finalize -- now
+always runs as its own explicit step before handing the file to the
+default player, rather than only ever happening as a side effect of
+the AAC transcode succeeding; if that transcode fails for any reason,
+the seek bar still works even though the file falls back to Opus
+audio.
+
+Saving a video `.fmff` back out via Save as... / `decode`, not just
+playing it live, hit the identical Opus-in-MP4 problem on the *export*
+side: both used to stream-copy the audio track untouched into whatever
+container the output extension asked for, which is exactly right for
+`.webm`/`.mkv` (Opus is WebM's own native audio codec, well supported
+wherever either format is used at all) but silently produced a
+plays-with-no-sound file for `.mp4`/`.mov`/`.m4v` -- the same MP4-
+family containers Windows can't reliably pull Opus out of. Those three
+extensions now force the audio through an AAC transcode on export too
+(the video itself stays a stream copy either way, so this doesn't add
+real encode time), the same fix live playback already gets above.
+
 ### Subtitles
 
 A text-based subtitle track (SRT, ASS/SSA, WebVTT, or already-mov_text)
@@ -615,9 +648,15 @@ the normal default) came out 20% smaller. A high source bitrate --
 lossless WAV/FLAC, which reports its raw PCM bitrate, typically
 four-figure kbps -- isn't "already lossy at some low target" the same
 way, so that case just gets the plain 128k default. `decode` transcodes
-to whatever container the output extension needs (`-c:a copy` when the container can hold Opus
-verbatim -- `.opus`/`.ogg`/`.m4a` -- a real re-encode otherwise, e.g.
-`.mp3`/`.wav`/`.flac`, since those can't). The viewer opens either a
+to whatever container the output extension needs: `-c:a copy` (no
+re-encode) for `.opus`/`.ogg`, Opus's own native container, where it's
+both legal *and* actually going to get decoded; `.mp4`/`.m4a` could
+hold the exact same Opus bytes just as legally, but -- same Windows
+Media Foundation limitation as a video's audio track, see "Video"
+above -- they don't reliably decode there, so those two are forced
+through a real AAC transcode instead of tried as a copy first;
+anything else (`.mp3`/`.wav`/`.flac`, ...) can't hold Opus at all, so
+it always gets a real transcode regardless. The viewer opens either a
 plain audio file or an audio `.fmff` by handing it straight to the
 system's default player (real seek bar, volume, etc.) -- the same thing
 a `.fmff` video now does too (see "Video" above), just with no picture
@@ -705,11 +744,16 @@ store, true for every file from before this).
 - **Audio/video tags**: whatever `ffprobe` reports as the container's own
   format-level tags, stored verbatim as JSON key/value pairs -- no
   curated allowlist to fall out of date. `decode`/Save as... restore them
-  with `-metadata key=value` on the FFmpeg remux that already runs for
-  most output formats; the one exception is `.mp4` output when there are
-  no tags to restore, which still uses the fast direct-extract path (no
-  FFmpeg invocation at all) exactly as before, since a plain copy is
-  strictly cheaper when there's nothing to add back.
+  with `-metadata key=value` on the FFmpeg remux that runs for
+  essentially every output format now. `.mp4`/`.mov`/`.m4v`/`.m4a` no
+  longer get a tags-free fast path that skips FFmpeg entirely the way
+  they used to: those extensions need the remux regardless, to force
+  audio to AAC instead of leaving it as Opus (see "Video"/"Audio"
+  above). The CLI's `decode` keeps a narrower version of that old fast
+  path only as a last-resort fallback for when FFmpeg genuinely isn't
+  installed -- it prints a clear warning that tags won't be restored
+  and the Opus audio may not play everywhere, instead of silently
+  degrading.
 - **Image EXIF**: the source's raw EXIF block, byte-for-byte, not
   re-derived field by field -- the same passthrough philosophy JPEG's own
   DCT-coefficient path already uses elsewhere in this file. GPS
@@ -745,6 +789,34 @@ actually kills the in-progress `ffmpeg` subprocess rather than waiting for
 it to finish, so nothing partial gets written. Closing the batch window
 does the same thing automatically, so leaving the window open isn't the
 only way to stop a running batch.
+
+## Glue -- concatenating .fmff clips into one
+
+The viewer window also has a **Glue...** button: pick any number of
+`.fmff` video files, or any number of `.fmff` audio files (not a mix
+of both), either one at a time or by picking a whole folder (every
+`.fmff` inside it gets added, in name order), arrange them in the
+order they should play, and concatenate them into one new `.fmff`.
+
+This isn't a raw byte-level splice of the stored AV1/Opus segments.
+Each input is unpacked back to its own embedded fragmented MP4 (the
+same `extract_media()` "Video"/"Audio" above already use to play or
+export a file), FFmpeg's concat demuxer joins those into one file, and
+*that* gets fed straight back through `encode_video`/`encode_audio`
+exactly like any other source file would be. So the result is a
+freshly re-encoded clip, not a stream-copied splice carrying over
+whatever timestamp discontinuities a raw concat join tends to leave at
+each cut point.
+
+Every input has to already match on the one property that actually
+matters for concatenation to make sense: the same resolution for
+video, or the same sample rate and channel count for audio. FFmpeg's
+own concat demuxer doesn't refuse a mismatch itself -- it just hands
+back a file that glitches or fails to seek properly past the join --
+so Glue checks up front and raises a clear error (listing the
+mismatched values) instead of producing that silently.
+
+Viewer only for now -- there's no CLI subcommand for this yet.
 
 ## Benchmarks -- FMFF vs PNG/WebP, with real numbers
 
@@ -1014,10 +1086,10 @@ python F.M.F.F.py encode input.gif output.fmff        # animated GIF/WebP/APNG s
 python F.M.F.F.py encode input.mp4 output.fmff [--crf 30] [--speed 8] [--fps 30]
 python F.M.F.F.py decode output.fmff result.png
 python F.M.F.F.py decode output.fmff result.gif        # a multi-frame .fmff decodes to a full animation for .gif/.webp/.png, frame 0 alone otherwise
-python F.M.F.F.py decode output.fmff result.mp4        # .mp4 extracts the reconstructed stream directly, other video extensions remux via FFmpeg
+python F.M.F.F.py decode output.fmff result.mp4        # remuxes via FFmpeg, forcing AAC audio for .mp4/.mov/.m4v (Windows can't reliably decode Opus there); other video extensions keep Opus
 python F.M.F.F.py decode output.fmff result.mp4 --alpha-output alpha.mp4   # also pulls out the alpha track, if the source had one
 python F.M.F.F.py encode input.mp3 output.fmff [--audio-bitrate 96k]  # unset: auto-picked from the source's own bitrate, see "Audio" above
-python F.M.F.F.py decode output.fmff result.opus      # -c:a copy where the container allows it (.opus/.ogg/.m4a), a real transcode otherwise (.mp3/.wav/.flac/...)
+python F.M.F.F.py decode output.fmff result.opus      # -c:a copy for Opus's own native containers (.opus/.ogg); .mp4/.m4a get an AAC transcode instead (Windows can't reliably decode Opus there), anything else (.mp3/.wav/.flac/...) gets a real transcode
 python F.M.F.F.py encode input.pdf output.fmff        # stores the original PDF bytes themselves (recompressed if smaller), see "Documents" above
 python F.M.F.F.py encode input.txt output.fmff        # same passthrough approach for a text file
 python F.M.F.F.py decode output.fmff result.pdf       # recovers the exact original bytes, byte-for-byte -- not a rendered page
