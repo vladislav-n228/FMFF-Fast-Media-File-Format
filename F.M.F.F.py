@@ -2007,6 +2007,89 @@ def _default_audio_bitrate(source_bit_rate):
     return f"{DEFAULT_AUDIO_BITRATE_KBPS}k"
 
 
+if os.name == "nt":
+    import ctypes as _ctypes
+    from ctypes import wintypes as _wintypes
+
+    # Python's os.utime() only ever touches last-write/last-access time,
+    # even on Windows -- there is no stdlib way to set a file's Created
+    # time at all, so restoring it after encoding needs a direct Win32
+    # SetFileTime call. FILE_WRITE_ATTRIBUTES (not the heavier
+    # GENERIC_WRITE) is the minimal access right SetFileTime actually
+    # needs.
+    _FILE_WRITE_ATTRIBUTES = 0x0100
+    _FILE_SHARE_READ = 0x00000001
+    _FILE_SHARE_WRITE = 0x00000002
+    _OPEN_EXISTING = 3
+    _FILE_ATTRIBUTE_NORMAL = 0x80
+    _WIN_EPOCH_DELTA = 116444736000000000  # 100ns ticks, 1601-01-01 -> 1970-01-01
+
+    _CreateFileW = _ctypes.windll.kernel32.CreateFileW
+    _CreateFileW.argtypes = [_wintypes.LPCWSTR, _wintypes.DWORD, _wintypes.DWORD,
+                              _wintypes.LPVOID, _wintypes.DWORD, _wintypes.DWORD, _wintypes.HANDLE]
+    _CreateFileW.restype = _wintypes.HANDLE
+
+    _SetFileTime = _ctypes.windll.kernel32.SetFileTime
+    _SetFileTime.argtypes = [_wintypes.HANDLE, _ctypes.POINTER(_wintypes.FILETIME),
+                              _ctypes.POINTER(_wintypes.FILETIME), _ctypes.POINTER(_wintypes.FILETIME)]
+    _SetFileTime.restype = _wintypes.BOOL
+
+    _CloseHandle = _ctypes.windll.kernel32.CloseHandle
+    _CloseHandle.argtypes = [_wintypes.HANDLE]
+    _CloseHandle.restype = _wintypes.BOOL
+
+    _INVALID_HANDLE_VALUE = _ctypes.c_void_p(-1).value
+
+    def _win_set_creation_time(path, timestamp):
+        ticks = int(timestamp * 10_000_000) + _WIN_EPOCH_DELTA
+        ft = _wintypes.FILETIME(ticks & 0xFFFFFFFF, (ticks >> 32) & 0xFFFFFFFF)
+        handle = _CreateFileW(str(path), _FILE_WRITE_ATTRIBUTES,
+                               _FILE_SHARE_READ | _FILE_SHARE_WRITE, None,
+                               _OPEN_EXISTING, _FILE_ATTRIBUTE_NORMAL, None)
+        if handle is None or handle == _INVALID_HANDLE_VALUE:
+            raise OSError(f"CreateFileW failed ({_ctypes.get_last_error()})")
+        try:
+            if not _SetFileTime(handle, _ctypes.byref(ft), None, None):
+                raise OSError(f"SetFileTime failed ({_ctypes.get_last_error()})")
+        finally:
+            _CloseHandle(handle)
+else:
+    def _win_set_creation_time(path, timestamp):
+        pass
+
+
+def _copy_source_timestamps(source_path, dest_path):
+    """Copy source_path's Created and Modified timestamps onto dest_path
+    -- so a freshly encoded .fmff shows the same dates Explorer already
+    showed for its original source file (what a plain Explorer copy of
+    any other file type always does), rather than the moment it
+    happened to get encoded. Modified/accessed via os.utime (portable);
+    Created is Windows-only (os.utime never touches it there either --
+    see _win_set_creation_time -- and NTFS is the only filesystem this
+    project targets that has a real creation-time field at all, unlike
+    Unix's own birth-time-less stat). Best-effort throughout: silently
+    does nothing if source_path is missing/unknown, or if a timestamp
+    call fails for any reason (a locked file, a filesystem that doesn't
+    support it, ...) -- a wrong timestamp was already the bug being
+    fixed here, never trade it for a hard crash on an otherwise-good
+    encode."""
+    if not source_path:
+        return
+    try:
+        src_stat = os.stat(source_path)
+    except OSError:
+        return
+    try:
+        os.utime(dest_path, (src_stat.st_atime, src_stat.st_mtime))
+    except OSError:
+        pass
+    if os.name == "nt":
+        try:
+            _win_set_creation_time(dest_path, src_stat.st_ctime)
+        except OSError:
+            pass
+
+
 class FMFFEncoder:
     def __init__(self, tile_size=None, quality=80, thumb_max=64):
         # None means "use STILL_TILE_SIZE" (see encode_image). Only
@@ -2141,6 +2224,7 @@ class FMFFEncoder:
                 f.write(e.payload)
             f.write(blob)
             f.write(metadata_blob)
+        _copy_source_timestamps(input_path, output_path)
 
         return {"width": width, "height": height, "size": running,
                 "mode": "document-passthrough", "compressed": compressed_won,
@@ -2262,6 +2346,7 @@ class FMFFEncoder:
                 f.write(e.payload)
             f.write(blob)
             f.write(metadata_blob)
+        _copy_source_timestamps(input_path, output_path)
 
         return {"width": im.width, "height": im.height, "has_alpha": False,
                 "tiles": 0, "size": running, "mode": "jpeg-passthrough",
@@ -2367,6 +2452,11 @@ class FMFFEncoder:
             for e in entries:
                 f.write(e.payload)
             f.write(metadata_blob)
+        # img.filename is set automatically by Pillow for anything opened
+        # via Image.open(path) -- None for an in-memory/generated image
+        # (a screenshot, a decoded frame), which _copy_source_timestamps
+        # already treats as "nothing to copy, leave it alone".
+        _copy_source_timestamps(getattr(img, "filename", None), output_path)
 
         return {
             "width": width, "height": height, "has_alpha": has_alpha,
@@ -3108,6 +3198,7 @@ class FMFFEncoder:
                 for s in alpha_blobs:
                     f.write(s)
             f.write(metadata_blob)
+        _copy_source_timestamps(input_path, output_path)
 
         self.last_video_backend = "ffmpeg/libsvtav1+libopus" if has_audio else "ffmpeg/libsvtav1"
         return {"width": width, "height": height, "frame_count": info["frame_count"],
@@ -3224,6 +3315,7 @@ class FMFFEncoder:
             for s in segment_blobs:
                 f.write(s)
             f.write(metadata_blob)
+        _copy_source_timestamps(input_path, output_path)
 
         return {"duration_ms": info["duration_ms"], "sample_rate": info["sample_rate"],
                 "channels": info["channels"], "size": running, "segments": len(segments),
