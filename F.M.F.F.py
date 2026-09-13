@@ -5597,8 +5597,8 @@ def cmd_doctor(args):
                                   "files, and the silent-preview video fallback"),
         ("jpeglib", "jpeglib", "JPEG sources only -- enables lossless coefficient "
                                 "passthrough (falls back to the normal tile codec without it)"),
-        ("pymupdf", "fitz", "PDF sources only -- first-page preview thumbnail (storing/"
-                             "recovering the PDF's own bytes needs nothing here)"),
+        ("pymupdf", "pymupdf", "PDF sources only -- first-page preview thumbnail (storing/"
+                                "recovering the PDF's own bytes needs nothing here)"),
         ("tkinterdnd2", "tkinterdnd2", "viewer only -- drag-and-drop (Open/Batch... "
                                         "buttons work without it)"),
     ):
