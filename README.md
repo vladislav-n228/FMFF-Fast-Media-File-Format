@@ -3,8 +3,27 @@
 An experimental image/video/audio/document container (`.fmff`) with a
 reference Python encoder, decoder, and viewer -- also distributed as a
 standalone Windows `.exe`, no Python install required (see "Windows
-.exe" below). Each content type is handled very differently on purpose
--- see below.
+.exe" below).
+
+**The one thing FMFF does that no mainstream image format does at all:**
+keep more than one version of the same still image -- an original photo,
+a retouched copy, a selection mask, whatever else got derived from it --
+in one file, where a new version only costs bytes for the tiles that
+actually changed: **0 bytes** for a version that changed nothing, a few
+KB for a small retouch, not a second full copy every time. PNG, WebP, MP4,
+and PDF have no concept of this at all -- the closest analogue elsewhere
+is a version-control system, not an image format. See "Versions" below
+for exactly how it works and what it costs on a real file.
+
+Beyond that headline feature, this is a container where each content
+type is handled very differently on purpose, with tradeoffs disclosed
+rather than hidden -- see "Benchmarks" and "Status / limitations" below
+before deciding whether it's useful for you. FMFF's own hybrid tile codec
+(stills/animation) is genuinely this project's own design; video and
+audio instead wrap FFmpeg's own AV1/Opus encoders rather than reinventing
+them (see "Video" and "Audio" below for why that's a deliberate choice,
+not a shortcut). This is a personal/hobby project, not a production
+codec -- see "Status / limitations" for the honest scope.
 
 ## Images -- FMFF's own hybrid codec
 
@@ -479,7 +498,10 @@ winget install BtbN.FFmpeg.LGPL.8.1
 An LGPL build is used deliberately, though it's not actually a licensing
 requirement here: FMFF only ever shells out to `ffmpeg.exe`/`ffprobe.exe`
 as separate processes, it never links against FFmpeg, so which
-build/license variant you install doesn't affect FMFF's own code.
+build/license variant you install doesn't affect FMFF's own code. Run
+`python F.M.F.F.py doctor` after installing to confirm `libsvtav1`/
+`libaom-av1`/`libopus` all actually made it into the build FFmpeg found
+on PATH, rather than finding out the hard way mid-encode.
 
 ## Audio -- wrapped Opus via FFmpeg
 
@@ -649,6 +671,56 @@ it to finish, so nothing partial gets written. Closing the batch window
 does the same thing automatically, so leaving the window open isn't the
 only way to stop a running batch.
 
+## Benchmarks -- FMFF vs PNG/WebP, with real numbers
+
+Numbers, not adjectives. [`benchmarks/bench_images.py`](benchmarks/bench_images.py)
+generates six small, seeded synthetic test images (two photo-like ones --
+one smooth/soft, one busier/textured -- a UI/screenshot mockup, a
+low-color pixel-art sprite, black-and-white line art, and pure random
+noise as a deliberately-included worst case), encodes each one with
+FMFF's own image codec, Pillow's PNG encoder, and Pillow's WebP encoder
+(both lossless and quality-matched lossy), and reports the real, measured
+file sizes and encode times side by side -- no image dataset is
+downloaded or committed to this repo; the script generates its own test
+images from a fixed seed, so anyone can reproduce (or challenge) these
+exact numbers on their own machine, and `--images-dir` swaps in real
+images instead of the synthetic stand-ins if you'd rather benchmark
+actual content.
+
+Run it yourself: `python benchmarks/bench_images.py`. Full results (with
+methodology notes and per-image pixel-fidelity numbers) land in
+`benchmarks/results.md`; raw data in `benchmarks/results.csv`. One run's
+headline numbers, FMFF quality=80 vs WebP quality=80 (matched, so the
+lossy-vs-lossy comparison is fair):
+
+| content type | FMFF vs PNG | FMFF vs WebP q80 |
+|---|---|---|
+| smooth photo-like | 83% smaller | 431% bigger |
+| detailed/textured photo-like | 71% smaller | 301% bigger |
+| UI/screenshot mockup | 157% bigger | 159% bigger |
+| pixel art / low-color sprite | 194% bigger | 1% bigger |
+| line art | 12% bigger | 49% smaller |
+| random noise (worst case) | 47% smaller | 132% bigger |
+
+**The honest reading of this**: FMFF's own lossy tile codec is not
+competitive with WebP's on raw compression ratio for photographic
+content -- WebP's predictive lossy codec is a more modern design than
+FMFF's JPEG-style per-tile DCT, and that gap is real, not a benchmark
+artifact (consistent with "encoding is pure Python per-tile" in "Status /
+limitations" below). FMFF beats PNG on most content (PNG has no lossy
+mode to fall back to when one would help) and wins outright on line art
+specifically; it loses on the flat/UI screenshot case too, where WebP's
+whole-image lossless prediction beats FMFF's smaller, per-tile palette
+encoding. FMFF's actual reason to exist isn't winning a compression-ratio
+contest against a mature, heavily-optimized format -- it's versioning,
+true-color alpha, and per-tile error resilience, none of which PNG or
+WebP has at all (see the top of this README and "Versions" below). Take
+the compression numbers at face value rather than a pitch that hides
+them; video/audio aren't included in this benchmark since they're just
+FFmpeg's own AV1/Opus encoders wrapped in this container (see "Video" and
+"Audio" above) -- comparing those would mostly measure this container's
+own small fixed overhead, not a codec FMFF wrote.
+
 ## Status / limitations
 
 This is a personal/hobby project, not a production tool:
@@ -664,7 +736,10 @@ This is a personal/hobby project, not a production tool:
 - Images: encoding is pure Python per-tile -- spread across CPU cores for
   large images (see "Multi-core encoding" above), but still Python-level
   work per tile, not a compiled codec, so it won't match a native
-  encoder's speed.
+  encoder's speed. Compression ratio, not just speed, also trails a
+  mature format like WebP on ordinary photographic content -- see
+  "Benchmarks" above for real numbers instead of a vague "it's smaller"
+  claim.
 - Video: the hybrid lossless-tile idea is specific to the image codec
   and doesn't apply to the AV1 stream inside a video `.fmff` (segment-
   level CRC32/corruption resilience does apply, though -- see "Video --
@@ -786,6 +861,14 @@ scenario, not as core format features:
 
 ## Requirements
 
+Run `python F.M.F.F.py doctor` any time to check all of the below at
+once -- what's found, what's missing, and the exact command to fix it
+(including checking that an installed FFmpeg actually has `libsvtav1`/
+`libaom-av1`/`libopus` compiled in, not just that `ffmpeg` itself is on
+PATH -- a real gap plain "FFmpeg not found" error messages used to miss
+entirely). Faster than reading a traceback to guess which of several
+optional libraries an error actually came from.
+
 - Python 3.9+
 - `numpy`, `Pillow`
 - `opencv-python` (viewer only: opening/playing ordinary image and video
@@ -833,6 +916,7 @@ python F.M.F.F.py output.fmff        # bare path also opens the viewer directly
 python F.M.F.F.py open-external output.fmff [--choose]   # headless: convert + hand off to an external player, no FMFF window -- see "Windows .exe" above
 python F.M.F.F.py register-filetype [--mode external|viewer]   # associate .fmff with double-click in Explorer (current user only)
 python F.M.F.F.py unregister-filetype
+python F.M.F.F.py doctor             # check FFmpeg (+ its encoders) and every optional library, with exact fixes for anything missing
 ```
 
 The same commands work with `F.M.F.F.exe` in place of `python F.M.F.F.py`

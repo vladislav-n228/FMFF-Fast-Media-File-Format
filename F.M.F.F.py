@@ -609,6 +609,62 @@ def _find_ffprobe():
     return _find_exe("ffprobe")
 
 
+def _ffmpeg_install_hint():
+    """One-line, copy-pasteable install command for the current OS --
+    used in every 'FFmpeg not found' error so the fix is never more than
+    a copy/paste away, instead of sending the user off to figure out the
+    right package manager invocation themselves."""
+    if os.name == "nt":
+        return "winget install BtbN.FFmpeg.LGPL.8.1"
+    if sys.platform == "darwin":
+        return "brew install ffmpeg"
+    return "sudo apt install ffmpeg   (or dnf/pacman/zypper -- whatever your distro uses)"
+
+
+def _ffmpeg_missing_message(what, tool="ffmpeg", codecs=None):
+    extra = "" if tool == "ffmpeg" else f" ({tool} ships in the same FFmpeg build)"
+    codec_note = f", built with {codecs}" if codecs else ""
+    return (
+        f"{what} needs {tool} on PATH{extra}{codec_note}. Install it with:\n"
+        f"    {_ffmpeg_install_hint()}\n"
+        f"then re-run this command (a PATH change doesn't reach an already-running "
+        f"process). Run `python F.M.F.F.py doctor` for a full check of what's found, "
+        f"what's missing, and exactly what to install.")
+
+
+def _ffmpeg_missing_error(what, tool="ffmpeg", codecs=None):
+    return RuntimeError(_ffmpeg_missing_message(what, tool, codecs))
+
+
+def _start_stderr_collector(proc):
+    """Drains proc.stderr into a list, on a background thread, from the
+    moment the process starts. FFmpeg is run with -loglevel error, so
+    under a working setup this collects nothing -- but when it fails
+    (missing encoder, unsupported input, bad pixel format, ...) this is
+    the only place the actual reason lives. Without draining it on a
+    thread, a real error long enough to fill the OS pipe buffer (the
+    common case is many repeated per-frame error lines) would block
+    FFmpeg writing to stderr while the main thread is separately blocked
+    reading stdout for -progress output -- a real deadlock, not a
+    hypothetical one, which is exactly why this used to be
+    stderr=DEVNULL instead of PIPE."""
+    lines = []
+    threading.Thread(target=lambda: lines.extend(proc.stderr), daemon=True).start()
+    return lines
+
+
+def _ffmpeg_failure_detail(stderr_lines):
+    detail = "".join(stderr_lines).strip()
+    if not detail:
+        return ""
+    # keep the tail -- ffmpeg's own actual error is almost always the
+    # last line or two, with setup/banner noise (if any leaked through
+    # -loglevel error at all) earlier
+    if len(detail) > 2000:
+        detail = "..." + detail[-2000:]
+    return f"\nffmpeg said:\n{detail}"
+
+
 # Pixel formats ffmpeg can decode that carry an actual alpha plane -- a
 # source using one of these is treated as a video-with-transparency
 # source (see encode_video's alpha handling / the module docstring).
@@ -845,8 +901,9 @@ def _encode_fragmented_av1(ffmpeg, input_path, blob_path, crf, speed, gop, fps,
             "-frag_duration", str(int(VIDEO_SEGMENT_SECONDS * 1_000_000))]
     cmd += [blob_path]
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, encoding="utf-8", errors="replace", bufsize=1)
+    stderr_lines = _start_stderr_collector(proc)
     cancelled = False
     for line in proc.stdout:
         if cancel_event is not None and cancel_event.is_set():
@@ -867,7 +924,8 @@ def _encode_fragmented_av1(ffmpeg, input_path, blob_path, crf, speed, gop, fps,
         raise EncodingCancelled("video encoding was cancelled")
     ret = proc.wait()
     if ret != 0 or not os.path.exists(blob_path):
-        raise RuntimeError(f"ffmpeg failed to encode video (exit code {ret})")
+        raise RuntimeError(f"ffmpeg failed to encode video (exit code {ret})"
+                            f"{_ffmpeg_failure_detail(stderr_lines)}")
     blob = open(blob_path, "rb").read()
     init_bytes, segment_blobs = _split_mp4_fragments(blob)
     segments = [(len(s), zlib.crc32(s) & 0xFFFFFFFF) for s in segment_blobs]
@@ -896,8 +954,9 @@ def _encode_fragmented_audio(ffmpeg, input_path, blob_path, bitrate, progress_cb
            "-frag_duration", str(int(VIDEO_SEGMENT_SECONDS * 1_000_000)),
            blob_path]
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, encoding="utf-8", errors="replace", bufsize=1)
+    stderr_lines = _start_stderr_collector(proc)
     cancelled = False
     for line in proc.stdout:
         if cancel_event is not None and cancel_event.is_set():
@@ -918,7 +977,8 @@ def _encode_fragmented_audio(ffmpeg, input_path, blob_path, bitrate, progress_cb
         raise EncodingCancelled("audio encoding was cancelled")
     ret = proc.wait()
     if ret != 0 or not os.path.exists(blob_path):
-        raise RuntimeError(f"ffmpeg failed to encode audio (exit code {ret})")
+        raise RuntimeError(f"ffmpeg failed to encode audio (exit code {ret})"
+                            f"{_ffmpeg_failure_detail(stderr_lines)}")
     blob = open(blob_path, "rb").read()
     init_bytes, segment_blobs = _split_mp4_fragments(blob)
     segments = [(len(s), zlib.crc32(s) & 0xFFFFFFFF) for s in segment_blobs]
@@ -2682,13 +2742,10 @@ class FMFFEncoder:
         _TEXT_SUBTITLE_CODECS's docstring."""
         ffmpeg = _find_ffmpeg()
         if ffmpeg is None:
-            raise RuntimeError(
-                "video encoding needs FFmpeg (with libsvtav1 + libopus) on PATH -- "
-                "install it, e.g. `winget install BtbN.FFmpeg.LGPL.8.1` on Windows")
+            raise _ffmpeg_missing_error("video encoding", codecs="libsvtav1 + libopus")
         ffprobe = _find_ffprobe()
         if ffprobe is None:
-            raise RuntimeError("video encoding needs ffprobe alongside ffmpeg to read "
-                                "source video metadata (it ships in the same FFmpeg build)")
+            raise _ffmpeg_missing_error("video encoding", tool="ffprobe")
 
         input_path = str(input_path)
         info = _ffprobe_info(input_path, ffprobe)
@@ -2851,13 +2908,10 @@ class FMFFEncoder:
         same as encode_video does, when there isn't one."""
         ffmpeg = _find_ffmpeg()
         if ffmpeg is None:
-            raise RuntimeError(
-                "audio encoding needs FFmpeg (with libopus) on PATH -- "
-                "install it, e.g. `winget install BtbN.FFmpeg.LGPL.8.1` on Windows")
+            raise _ffmpeg_missing_error("audio encoding", codecs="libopus")
         ffprobe = _find_ffprobe()
         if ffprobe is None:
-            raise RuntimeError("audio encoding needs ffprobe alongside ffmpeg to read "
-                                "source audio metadata (it ships in the same FFmpeg build)")
+            raise _ffmpeg_missing_error("audio encoding", tool="ffprobe")
 
         input_path = str(input_path)
         info = _ffprobe_info(input_path, ffprobe)
@@ -4756,7 +4810,7 @@ def _save_video(source_path, is_fmff, fps, path, dest_ext, progress_cb):
             else:
                 ffmpeg = _find_ffmpeg()
                 if ffmpeg is None:
-                    raise RuntimeError("saving to this format needs FFmpeg on PATH")
+                    raise _ffmpeg_missing_error("saving to this format")
                 with tempfile.TemporaryDirectory(prefix="fmff_save_") as tmp:
                     blob_path = os.path.join(tmp, "video.mp4")
                     dec.extract_media(blob_path)
@@ -4800,7 +4854,7 @@ def _save_audio(source_path, is_fmff, path, dest_ext, progress_cb):
             else:
                 ffmpeg = _find_ffmpeg()
                 if ffmpeg is None:
-                    raise RuntimeError("saving to this format needs FFmpeg on PATH")
+                    raise _ffmpeg_missing_error("saving to this format")
                 with tempfile.TemporaryDirectory(prefix="fmff_save_") as tmp:
                     blob_path = os.path.join(tmp, "audio.mp4")
                     dec.extract_media(blob_path)
@@ -5091,9 +5145,9 @@ def cmd_decode(args):
         elif out_ext in VIDEO_EXTS or (out_ext == ".mp4" and dec.tags):
             ffmpeg = _find_ffmpeg()
             if ffmpeg is None:
-                raise SystemExit("writing this format needs FFmpeg on PATH "
-                                  "(or pass a .mp4 output to just extract the reconstructed "
-                                  "stream directly)")
+                raise SystemExit(_ffmpeg_missing_message("writing this format") +
+                                  "\n(or pass a .mp4 output to just extract the reconstructed "
+                                  "stream directly, no FFmpeg needed)")
             with tempfile.TemporaryDirectory(prefix="fmff_dec_") as tmp:
                 blob_path = os.path.join(tmp, "video.mp4")
                 dec.extract_media(blob_path)
@@ -5139,9 +5193,9 @@ def cmd_decode(args):
         else:
             ffmpeg = _find_ffmpeg()
             if ffmpeg is None:
-                raise SystemExit("writing this format needs FFmpeg on PATH "
-                                  "(or pass a .mp4 output to just extract the reconstructed "
-                                  "Opus stream directly)")
+                raise SystemExit(_ffmpeg_missing_message("writing this format") +
+                                  "\n(or pass a .mp4 output to just extract the reconstructed "
+                                  "Opus stream directly, no FFmpeg needed)")
             with tempfile.TemporaryDirectory(prefix="fmff_dec_") as tmp:
                 blob_path = os.path.join(tmp, "audio.mp4")
                 dec.extract_media(blob_path)
@@ -5488,6 +5542,78 @@ def cmd_view(args):
     MediaViewer(args.input, simulate_slow=args.simulate_slow).run()
 
 
+def cmd_doctor(args):
+    """Checks every dependency this file can use (required and optional)
+    and prints what's found, what's missing, and the exact command to
+    fix it -- one place to point someone stuck on a bare traceback,
+    instead of them having to work out which of several optional
+    libraries an error actually came from. See README's "Requirements"."""
+    import PIL
+    print(f"Python {sys.version.split()[0]} on {sys.platform}")
+    print(f"  [ok] numpy {np.__version__}")
+    print(f"  [ok] Pillow {PIL.__version__}")
+
+    ffmpeg = _find_ffmpeg()
+    ffprobe = _find_ffprobe()
+    if ffmpeg:
+        try:
+            ver_line = subprocess.run([ffmpeg, "-version"], capture_output=True,
+                                       text=True, check=True).stdout.splitlines()[0]
+        except Exception:
+            ver_line = "(found, but couldn't run it to check its version)"
+        print(f"  [ok] ffmpeg -- {ver_line}")
+        try:
+            encoders = subprocess.run([ffmpeg, "-hide_banner", "-encoders"],
+                                       capture_output=True, text=True, check=True).stdout
+        except Exception:
+            encoders = ""
+        for codec, needed_for in (
+            ("libsvtav1", "video encoding"),
+            ("libaom-av1", "video-with-alpha encoding"),
+            ("libopus", "audio encoding, and a video's own audio track"),
+        ):
+            if codec in encoders:
+                print(f"      [ok] {codec} -- {needed_for}")
+            else:
+                print(f"      [MISSING] {codec} -- needed for {needed_for}. This FFmpeg "
+                      f"build doesn't have it compiled in (a common gap outside the exact "
+                      f"build README recommends); reinstall with:\n"
+                      f"          {_ffmpeg_install_hint()}")
+    else:
+        print(f"  [missing, optional] ffmpeg -- needed for video/audio encoding and "
+              f"decoding only (images and documents need nothing here). Install with:\n"
+              f"      {_ffmpeg_install_hint()}")
+    if ffprobe:
+        print("  [ok] ffprobe")
+    elif ffmpeg:
+        print(f"  [MISSING] ffprobe -- ships in the same FFmpeg build as the ffmpeg found "
+              f"above, but wasn't found alongside it. Reinstall with:\n"
+              f"      {_ffmpeg_install_hint()}")
+    else:
+        print("  [missing, optional] ffprobe -- ships with ffmpeg, see above")
+
+    for pip_name, module, why in (
+        ("opencv-python", "cv2", "viewer only -- opening/playing ordinary image/video "
+                                  "files, and the silent-preview video fallback"),
+        ("jpeglib", "jpeglib", "JPEG sources only -- enables lossless coefficient "
+                                "passthrough (falls back to the normal tile codec without it)"),
+        ("pymupdf", "fitz", "PDF sources only -- first-page preview thumbnail (storing/"
+                             "recovering the PDF's own bytes needs nothing here)"),
+        ("tkinterdnd2", "tkinterdnd2", "viewer only -- drag-and-drop (Open/Batch... "
+                                        "buttons work without it)"),
+    ):
+        try:
+            __import__(module)
+            print(f"  [ok] {pip_name}")
+        except ImportError:
+            print(f"  [missing, optional] {pip_name} -- {why}. `pip install {pip_name}`")
+
+    print("\n[ok] = present. [missing, optional] only limits the one feature named next "
+          "to it -- everything else in this file still works. [MISSING] (no \"optional\") "
+          "is a real gap for a feature you evidently tried to use (ffmpeg/ffprobe found "
+          "but incomplete).")
+
+
 def main():
     p = argparse.ArgumentParser(prog="fmff", description="FMFF encoder / decoder / viewer")
     sub = p.add_subparsers(dest="command", required=True)
@@ -5595,9 +5721,15 @@ def main():
     pu = sub.add_parser("unregister-filetype", help="undo register-filetype")
     pu.set_defaults(func=cmd_unregister_filetype)
 
+    pdoc = sub.add_parser("doctor",
+                           help="check every dependency this file can use (FFmpeg + its "
+                                "encoders, and each optional Python library) and print "
+                                "what's found, what's missing, and how to fix it")
+    pdoc.set_defaults(func=cmd_doctor)
+
     argv = sys.argv[1:]
     known_commands = {"encode", "add-version", "add-mask", "decode", "info", "view",
-                       "open-external", "register-filetype", "unregister-filetype"}
+                       "open-external", "register-filetype", "unregister-filetype", "doctor"}
     if not argv:
         # No arguments at all -- a plain double-click of the .exe itself
         # (not via a file association, which always passes a path -- see
