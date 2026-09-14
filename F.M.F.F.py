@@ -1775,7 +1775,7 @@ def _load_monospace_font(size):
         return ImageFont.load_default()
 
 
-def _render_pdf_pages(input_path):
+def _render_pdf_pages(input_path, progress_cb=None):
     """One PIL Image per page of a PDF, rasterized via PyMuPDF at
     DOCUMENT_RENDER_DPI. See this section's docstring for what this
     deliberately doesn't preserve (text, links, forms, ...).
@@ -1804,10 +1804,13 @@ def _render_pdf_pages(input_path):
     doc = pymupdf.open(str(input_path))
     try:
         pages = []
-        for page in doc:
+        n_pages = doc.page_count
+        for i, page in enumerate(doc):
             pix = page.get_pixmap(dpi=DOCUMENT_RENDER_DPI)
             mode = "RGBA" if pix.alpha else "RGB"
             pages.append(Image.frombytes(mode, (pix.width, pix.height), pix.samples))
+            if progress_cb:
+                progress_cb(i + 1, n_pages)
         if not pages:
             raise ValueError(f"{input_path} has no pages")
         return pages
@@ -1815,7 +1818,7 @@ def _render_pdf_pages(input_path):
         doc.close()
 
 
-def _render_text_pages(input_path):
+def _render_text_pages(input_path, progress_cb=None):
     """One PIL Image per page of a plain-text file, word-wrapped and
     paginated onto flat white pages -- Pillow/a system font only, no
     external dependency at all. Monospace so the character count that
@@ -1851,6 +1854,7 @@ def _render_text_pages(input_path):
             raw_line, width=chars_per_line, replace_whitespace=False,
             drop_whitespace=False, break_long_words=True) or [""])
 
+    total_pages = max(1, -(-len(wrapped) // lines_per_page))
     pages = []
     for i in range(0, len(wrapped), lines_per_page):
         img = Image.new("1", (page_w, page_h), 1)
@@ -1860,10 +1864,12 @@ def _render_text_pages(input_path):
             draw.text((_DOCUMENT_MARGIN, y), line, font=font, fill=0)
             y += line_h
         pages.append(img.convert("RGB"))
+        if progress_cb:
+            progress_cb(len(pages), total_pages)
     return pages or [Image.new("RGB", (page_w, page_h), (255, 255, 255))]
 
 
-def _render_document_pages(input_path):
+def _render_document_pages(input_path, progress_cb=None):
     """Dispatch to the right renderer for a document's extension -- shared
     by MediaViewer._load_document_file/_load_fmff_document (previews a
     PDF/.txt, plain or recovered from a .fmff, without writing anything
@@ -1872,9 +1878,9 @@ def _render_document_pages(input_path):
     became a preview-only path -- see this section's own docstring)."""
     ext = Path(input_path).suffix.lower()
     if ext == ".pdf":
-        return _render_pdf_pages(input_path)
+        return _render_pdf_pages(input_path, progress_cb=progress_cb)
     if ext == ".txt":
-        return _render_text_pages(input_path)
+        return _render_text_pages(input_path, progress_cb=progress_cb)
     raise ValueError(f"not a supported document type: {ext}")
 
 
@@ -3886,16 +3892,22 @@ class FMFFDecoder:
         rgb = _ycc_to_rgb(np.dstack(planes))
         return Image.fromarray(np.clip(rgb, 0, 255).astype(np.uint8), "RGB")
 
-    def _reconstruct_segmented(self, blob_offset, init_length, init_crc32, segments, what):
+    def _reconstruct_segmented(self, blob_offset, init_length, init_crc32, segments, what,
+                                progress_cb=None):
         """Shared by extract_media/extract_alpha_media: read the init
         chunk plus each listed segment from self.path starting at
         blob_offset, dropping any segment that fails its CRC32 (or that a
         truncated file doesn't have), and return the concatenated bytes.
         Returns (data, corrupt_count). A corrupt init chunk always raises
         -- see extract_media's docstring for why that one case can't
-        gracefully degrade."""
+        gracefully degrade. progress_cb, if given, is called with
+        (segments done, total segments) after each one -- a heavy video's
+        worth of segments can take a visible moment to read/CRC-check,
+        and the caller (the viewer) uses this to show real progress
+        instead of just sitting there."""
         corrupt = 0
         pieces = []
+        total = len(segments)
         with open(self.path, "rb") as f:
             f.seek(blob_offset)
             init_bytes = f.read(init_length)
@@ -3906,17 +3918,19 @@ class FMFFDecoder:
                     f"isn't something FMFF can gracefully skip past)")
             pieces.append(init_bytes)
             offset = blob_offset + init_length
-            for length, expected_crc in segments:
+            for i, (length, expected_crc) in enumerate(segments):
                 f.seek(offset)
                 chunk = f.read(length)
                 offset += length
                 if len(chunk) != length or (zlib.crc32(chunk) & 0xFFFFFFFF) != expected_crc:
                     corrupt += 1
-                    continue
-                pieces.append(chunk)
+                else:
+                    pieces.append(chunk)
+                if progress_cb:
+                    progress_cb(i + 1, total)
         return b"".join(pieces), corrupt
 
-    def extract_media(self, out_path):
+    def extract_media(self, out_path, progress_cb=None):
         """Reconstruct the embedded video or audio (video/audio only) as
         a standalone, playable file at out_path -- a fragmented MP4
         (AV1 video + Opus audio, or Opus-only for a CONTENT_AUDIO file --
@@ -3933,12 +3947,12 @@ class FMFFDecoder:
         data, self.last_corrupt_segments = self._reconstruct_segmented(
             self.media_blob_offset, self.init_segment_length,
             self.init_segment_crc32, self.segments,
-            "audio" if self.is_audio else "video")
+            "audio" if self.is_audio else "video", progress_cb=progress_cb)
         with open(out_path, "wb") as f:
             f.write(data)
         return out_path
 
-    def extract_alpha_media(self, out_path):
+    def extract_alpha_media(self, out_path, progress_cb=None):
         """Same as extract_media, but for the second, grayscale AV1 track
         that carries the alpha plane on a video encoded from a source
         with transparency (has_video_alpha) -- see encode_video's alpha
@@ -3947,7 +3961,8 @@ class FMFFDecoder:
             raise ValueError("this video has no alpha track")
         data, self.last_corrupt_alpha_segments = self._reconstruct_segmented(
             self.alpha_media_blob_offset, self.alpha_init_segment_length,
-            self.alpha_init_segment_crc32, self.alpha_segments, "video alpha")
+            self.alpha_init_segment_crc32, self.alpha_segments, "video alpha",
+            progress_cb=progress_cb)
         with open(out_path, "wb") as f:
             f.write(data)
         return out_path
@@ -4285,8 +4300,9 @@ class MediaViewer:
         toolbar = tk.Frame(root, bg=DARK_PANEL)
         toolbar.pack(fill="x")
         for text, cmd in (("Open", self.on_open), ("Screenshot", self.on_screenshot),
-                          ("Save as...", self.on_save), ("Batch...", self.on_batch),
-                          ("Glue...", self.on_glue)):
+                          ("Save as...", self.on_save), ("Add version...", self.on_add_version),
+                          ("Open externally", self.on_open_external),
+                          ("Batch...", self.on_batch), ("Glue...", self.on_glue)):
             tk.Button(toolbar, text=text, command=cmd, bg=DARK_BTN, fg=DARK_FG,
                       activebackground="#454545", activeforeground=DARK_FG,
                       relief="flat", padx=10, pady=4).pack(side="left", padx=4, pady=4)
@@ -4400,13 +4416,20 @@ class MediaViewer:
         try:
             while True:
                 kind, payload = self.q.get_nowait()
-                if kind == "fmff_tile":
+                if kind == "fmff_base":
+                    self._fmff_buffer = payload
+                elif kind == "fmff_tile":
+                    if self._fmff_buffer is None:
+                        continue  # a stale tile from a load that's since been superseded
                     entry, y0, x0, decoded = payload
                     if entry.plane == PLANE_ALPHA:
                         self._fmff_buffer[y0:y0 + entry.h, x0:x0 + entry.w, 3] = decoded
                     else:
                         self._fmff_buffer[y0:y0 + entry.h, x0:x0 + entry.w, :3] = decoded
                     self._fmff_tiles_done += 1
+                    if self._fmff_tiles_total:
+                        pct = self._fmff_tiles_done * 100 // self._fmff_tiles_total
+                        self.set_status(f"decoding... {pct}%")
                 elif kind == "fmff_done":
                     # First (and only) time the image is shown -- see
                     # _load_fmff_image for why there's no tile-by-tile blit.
@@ -4445,6 +4468,27 @@ class MediaViewer:
                     self._anim_frames, self._anim_durations, self._anim_idx = frames, durations, 0
                     self._animate()
                     self.set_status(f"rendered {len(frames)} page(s)")
+                elif kind == "add_version_done":
+                    fmff_path, version_index = payload
+                    if self.current_is_fmff and self.current_source_path == fmff_path:
+                        self._switch_fmff_version(version_index)
+                elif kind == "fmff_video_alpha_ready":
+                    # See _load_fmff_video: extraction (the slow part) already
+                    # ran in the background, this just starts in-window
+                    # playback -- the one part of that path that has to
+                    # happen on the GUI thread.
+                    blob_path, alpha_path, w, h, corrupt_note, alpha_note = payload
+                    self.set_status(f"playing in-window with alpha ({w}x{h}, "
+                                     f"silent -- alpha video can't use the external player"
+                                     f"{corrupt_note}{alpha_note})")
+                    self._load_video_with_alpha(blob_path, alpha_path)
+                elif kind == "fmff_video_fallback":
+                    # See _load_fmff_video: the default player failed to
+                    # launch, fall back to FMFF's own silent in-window loop.
+                    blob_path, corrupt_note, exc_str = payload
+                    self.set_status(f"couldn't launch default player ({exc_str}) -- "
+                                     f"falling back to silent in-window preview{corrupt_note}")
+                    self._load_video(blob_path, status_suffix=corrupt_note)
                 elif kind in ("error", "status"):
                     self.set_status(payload)
         except queue.Empty:
@@ -4471,6 +4515,64 @@ class MediaViewer:
         ])
         if path:
             self.open_path(path)
+
+    def on_open_external(self):
+        """Hand whatever's currently loaded off to the OS's own default
+        app for its format -- the same thing double-clicking it in
+        Explorer/Finder would do, instead of FMFF's own in-window
+        preview. Most useful for a PDF (FMFF's internal page preview has
+        no text layer, search, or hyperlinks -- see encode_document),
+        but works the same way for every content type, not just
+        documents: a plain already-standard file opens directly, an
+        .fmff is decoded to a temp file first (mirrors cmd_open_external,
+        the CLI/registered-filetype equivalent of this), and a
+        screenshot with no file on disk yet is saved to a temp PNG."""
+        source_path = self.current_source_path
+        is_fmff = self.current_is_fmff
+
+        def launch(target_path):
+            try:
+                _open_with_default_player(target_path)
+                self.q.put(("status", f"opened externally: {target_path}"))
+            except Exception as exc:
+                self.q.put(("status", f"failed to open externally: {exc}"))
+
+        if is_fmff and source_path:
+            def convert_and_launch():
+                try:
+                    dec = FMFFDecoder(source_path)
+                    if dec.is_video:
+                        out_ext = ".mp4"
+                    elif dec.is_audio:
+                        out_ext = ".opus" if _find_ffmpeg() else ".mp4"
+                    elif dec.is_jpeg_passthrough:
+                        out_ext = ".jpg"
+                    elif dec.is_document:
+                        out_ext = dec.tags.get("doc_ext", ".pdf")
+                    elif dec.is_animated:
+                        out_ext = ".webp" if dec.has_alpha else ".gif"
+                    else:
+                        out_ext = ".png"
+                    tmp_dir = tempfile.mkdtemp(prefix="fmff_open_")
+                    out_path = os.path.join(tmp_dir, "content" + out_ext)
+                    cmd_decode(argparse.Namespace(input=source_path, output=out_path,
+                                                   alpha_output=None, version=None))
+                    launch(out_path)
+                except Exception as exc:
+                    self.q.put(("status", f"failed to open externally: {exc}"))
+            self.set_status("converting for external app...")
+            threading.Thread(target=convert_and_launch, daemon=True).start()
+        elif source_path and os.path.isfile(source_path):
+            self.set_status("opening externally...")
+            threading.Thread(target=launch, args=(source_path,), daemon=True).start()
+        elif self.current_pil is not None:
+            tmp_dir = tempfile.mkdtemp(prefix="fmff_open_")
+            out_path = os.path.join(tmp_dir, "content.png")
+            self.current_pil.save(out_path)
+            self.set_status("opening externally...")
+            threading.Thread(target=launch, args=(out_path,), daemon=True).start()
+        else:
+            self.set_status("nothing to open externally")
 
     def on_batch(self):
         BatchConvertWindow(self.root)
@@ -4620,13 +4722,19 @@ class MediaViewer:
 
         def worker():
             durations = d.frame_durations_ms()
+
+            def on_progress(frame, n_frames):
+                if not stop_event.is_set():
+                    pct = (frame + 1) * 100 // n_frames
+                    self.q.put(("status", f"decoding frame {frame + 1}/{n_frames} ({pct}%)"))
+
             # full_sequence() decodes every frame in one linear pass instead
             # of calling full(frame=i) per frame (which re-scans the whole
             # entry list each time -- quadratic in frame count, see its
             # docstring), so this can't check stop_event between frames the
             # way the old loop did; cancelling mid-decode just discards the
             # result below instead.
-            frames = d.full_sequence()
+            frames = d.full_sequence(progress_cb=on_progress)
             if not stop_event.is_set():
                 self.q.put(("fmff_anim_done", (frames, durations, d.frame_count)))
 
@@ -4648,17 +4756,29 @@ class MediaViewer:
         self._fmff_w, self._fmff_h = d.width, d.height
         self._fmff_tiles_total = len(d.tile_byte_ranges())
         self._fmff_tiles_done = 0
-
-        base = np.array(d.thumbnail().convert("RGBA").resize((d.width, d.height), Image.BILINEAR))
-        if not d.has_alpha:
-            base[:, :, 3] = 255
-        self._fmff_buffer = base
-        self.set_status("decoding...")
+        self._fmff_buffer = None
+        self.set_status("decoding... 0%")
 
         stop_event = threading.Event()
         self.stop_event = stop_event
 
         def worker():
+            # Upscaling the thumbnail to the image's own full resolution
+            # used to happen right here but on the GUI thread, before this
+            # background thread even started -- fine for an ordinary photo,
+            # but for a genuinely large image that resize alone could run
+            # long enough for Windows to flag the window "Not Responding"
+            # before a single tile had even started decoding, with no
+            # percentage shown the whole time either. Doing it in here
+            # instead means the GUI thread is never blocked on anything
+            # image-sized, for this or the tile decode below.
+            base = np.array(d.thumbnail().convert("RGBA").resize((d.width, d.height), Image.BILINEAR))
+            if not d.has_alpha:
+                base[:, :, 3] = 255
+            if stop_event.is_set():
+                return
+            self.q.put(("fmff_base", base))
+
             def on_tile(entry, y0, x0, decoded):
                 if stop_event.is_set():
                     return
@@ -4675,106 +4795,166 @@ class MediaViewer:
         poster_mode = "RGBA" if d.has_video_alpha else "RGB"
         poster = np.array(d.thumbnail().convert(poster_mode).resize((d.width, d.height), Image.BILINEAR))
         self._blit_pil(Image.fromarray(poster, poster_mode))
+        self.set_status("extracting... 0%")
 
-        tmp_dir = tempfile.mkdtemp(prefix="fmff_view_")
-        blob_path = os.path.join(tmp_dir, "video.mp4")
-        try:
-            d.extract_media(blob_path)
-        except ValueError as exc:
-            self.set_status(str(exc))
-            return
-        corrupt_note = (f", {d.last_corrupt_segments} of {d.segment_count} segment(s) "
-                         f"corrupt/missing -- skipped" if d.last_corrupt_segments else "")
+        stop_event = threading.Event()
+        self.stop_event = stop_event
 
-        if d.has_video_alpha:
-            # No mainstream player (ffplay included) can composite two
-            # separate video tracks into transparency on the fly -- so an
-            # alpha video always plays in-window, decoded and blended
-            # against the dark canvas frame-by-frame (see
-            # _load_video_with_alpha), the same way an RGBA *image*
-            # already does. That means no live audio for these even when
-            # the file has an audio track (audio is still preserved in
-            # the file itself -- Save as... / decode still gets it).
-            alpha_path = os.path.join(tmp_dir, "alpha.mp4")
+        def report(done, total):
+            if not stop_event.is_set() and total:
+                self.q.put(("status", f"extracting... {done * 100 // total}%"))
+
+        def worker():
+            # extract_media (reading + CRC-checking every segment) and the
+            # ffmpeg remuxes below all used to run right here on the GUI
+            # thread, with no progress shown at all -- fine for a small
+            # clip, but for a genuinely heavy video that's exactly what
+            # made Windows flag the window "Not Responding" while it sat
+            # there working. Everything slow now happens in this
+            # background thread instead; only the final hand-off (opening
+            # the default player, or falling back to the in-window loop)
+            # needs the GUI thread, via the queue below.
+            tmp_dir = tempfile.mkdtemp(prefix="fmff_view_")
+            blob_path = os.path.join(tmp_dir, "video.mp4")
             try:
-                d.extract_alpha_media(alpha_path)
+                d.extract_media(blob_path, progress_cb=report)
             except ValueError as exc:
-                self.set_status(str(exc))
+                self.q.put(("status", str(exc)))
                 return
-            alpha_note = (f", {d.last_corrupt_alpha_segments} of {d.alpha_segment_count} "
-                           f"alpha segment(s) corrupt/missing" if d.last_corrupt_alpha_segments else "")
-            self.set_status(f"playing in-window with alpha ({d.width}x{d.height}, "
-                             f"silent -- alpha video can't use the external player"
-                             f"{corrupt_note}{alpha_note})")
-            self._load_video_with_alpha(blob_path, alpha_path)
-            return
+            if stop_event.is_set():
+                return
+            corrupt_note = (f", {d.last_corrupt_segments} of {d.segment_count} segment(s) "
+                             f"corrupt/missing -- skipped" if d.last_corrupt_segments else "")
 
-        # blob_path's audio track is Opus, straight out of extract_media --
-        # exactly the bytes stored on disk (see encode_video). That's the
-        # same situation _load_fmff_audio already documents and works
-        # around: Windows' own Media Foundation pipeline (what the
-        # built-in Movies & TV / Media Player app, and anything else
-        # using the system's registered decoders, decodes through)
-        # doesn't reliably handle an Opus track at all unless it's inside
-        # Opus's own native Ogg container -- confirmed there by direct
-        # testing (silent failure or an outright "not supported" error).
-        # _load_fmff_audio's fix (remux to Ogg) can't apply here, since
-        # dropping the MP4 container would drop the video track with
-        # it -- so instead just the audio is transcoded to AAC (decoded
-        # by literally every player, this one included) while the AV1
-        # video stream is copied through untouched (`-c:v copy`, so this
-        # is fast regardless of the video's length -- only the audio is
-        # actually re-encoded). This is a disposable playback-only copy;
-        # the .fmff file itself keeps its original Opus audio exactly as
-        # encoded (Save as... / decode still gets that, not this AAC copy).
-        # blob_path itself is a streaming-style fragmented MP4 (FFmpeg's
-        # frag_keyframe+empty_moov output, written segment by segment as
-        # it's decoded -- see the module docstring's "Container layout
-        # for a video" section): its moov carries no duration and there's
-        # no sidx, since nothing knew the total length up front. Lightweight
-        # players -- Windows' own Movies & TV app included -- read only
-        # that header, so handed this file directly they show a dead,
-        # duration-less seek bar even though the video plays fine start to
-        # finish. Remuxing once (-c copy, no re-encode) into a normal
-        # finalized MP4 is what actually fixes that, by writing a real moov
-        # with the full duration once FFmpeg has seen every frame -- same
-        # fix `_save_video`'s .mp4 export already relies on. This is kept
-        # as its own remux, tried even if the AAC step below fails, so a
-        # seek bar that works stays independent of Opus/AAC compatibility.
-        play_path = blob_path
-        ffmpeg = _find_ffmpeg()
-        if ffmpeg is not None:
-            flat_path = os.path.join(tmp_dir, "video_flat.mp4")
-            result = subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                                      "-i", blob_path, "-c", "copy", flat_path],
-                                     check=False, stderr=subprocess.DEVNULL)
-            if result.returncode == 0 and os.path.exists(flat_path):
-                play_path = flat_path
+            if d.has_video_alpha:
+                # No mainstream player (ffplay included) can composite two
+                # separate video tracks into transparency on the fly -- so an
+                # alpha video always plays in-window, decoded and blended
+                # against the dark canvas frame-by-frame (see
+                # _load_video_with_alpha), the same way an RGBA *image*
+                # already does. That means no live audio for these even when
+                # the file has an audio track (audio is still preserved in
+                # the file itself -- Save as... / decode still gets it).
+                alpha_path = os.path.join(tmp_dir, "alpha.mp4")
+                try:
+                    d.extract_alpha_media(alpha_path, progress_cb=report)
+                except ValueError as exc:
+                    self.q.put(("status", str(exc)))
+                    return
+                if stop_event.is_set():
+                    return
+                alpha_note = (f", {d.last_corrupt_alpha_segments} of {d.alpha_segment_count} "
+                               f"alpha segment(s) corrupt/missing" if d.last_corrupt_alpha_segments else "")
+                self.q.put(("fmff_video_alpha_ready",
+                             (blob_path, alpha_path, d.width, d.height, corrupt_note, alpha_note)))
+                return
 
-            aac_path = os.path.join(tmp_dir, "video_playback.mp4")
-            result = subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                                      "-i", blob_path, "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                                      aac_path], check=False, stderr=subprocess.DEVNULL)
-            if result.returncode == 0 and os.path.exists(aac_path):
-                play_path = aac_path
+            # blob_path's audio track is Opus, straight out of extract_media --
+            # exactly the bytes stored on disk (see encode_video). That's the
+            # same situation _load_fmff_audio already documents and works
+            # around: Windows' own Media Foundation pipeline (what the
+            # built-in Movies & TV / Media Player app, and anything else
+            # using the system's registered decoders, decodes through)
+            # doesn't reliably handle an Opus track at all unless it's inside
+            # Opus's own native Ogg container -- confirmed there by direct
+            # testing (silent failure or an outright "not supported" error).
+            # _load_fmff_audio's fix (remux to Ogg) can't apply here, since
+            # dropping the MP4 container would drop the video track with
+            # it -- so instead just the audio is transcoded to AAC (decoded
+            # by literally every player, this one included) while the AV1
+            # video stream is copied through untouched (`-c:v copy`, so this
+            # is fast regardless of the video's length -- only the audio is
+            # actually re-encoded). This is a disposable playback-only copy;
+            # the .fmff file itself keeps its original Opus audio exactly as
+            # encoded (Save as... / decode still gets that, not this AAC copy).
+            # blob_path itself is a streaming-style fragmented MP4 (FFmpeg's
+            # frag_keyframe+empty_moov output, written segment by segment as
+            # it's decoded -- see the module docstring's "Container layout
+            # for a video" section): its moov carries no duration and there's
+            # no sidx, since nothing knew the total length up front. Lightweight
+            # players -- Windows' own Movies & TV app included -- read only
+            # that header, so handed this file directly they show a dead,
+            # duration-less seek bar even though the video plays fine start to
+            # finish. Remuxing once (-c copy, no re-encode) into a normal
+            # finalized MP4 is what actually fixes that, by writing a real moov
+            # with the full duration once FFmpeg has seen every frame -- same
+            # fix `_save_video`'s .mp4 export already relies on. This is kept
+            # as its own remux, tried even if the AAC step below fails, so a
+            # seek bar that works stays independent of Opus/AAC compatibility.
+            play_path = blob_path
+            ffmpeg = _find_ffmpeg()
+            if ffmpeg is not None:
+                total_frames = d.frame_count or None
 
-        # Handed off to the system's default player: a real separate
-        # window with real hardware decode, real audio, and a real seek
-        # bar -- FMFF's own in-window loop (_load_video) is silent and
-        # renders into this same window's canvas, which is worse on both
-        # counts, not just a stylistic difference. Falls back to that
-        # in-window loop only if launching the default player fails
-        # outright (e.g. nothing associated with .mp4 at all).
-        degraded_note = "" if play_path is not blob_path else \
-            " -- no ffmpeg found, so the seek bar/duration may not work right"
-        self.set_status(f"playing in the system's default player{corrupt_note}{degraded_note}")
-        try:
-            _open_with_default_player(play_path)
-            return
-        except OSError as exc:
-            self.set_status(f"couldn't launch default player ({exc}) -- "
-                             f"falling back to silent in-window preview{corrupt_note}")
-        self._load_video(blob_path, status_suffix=corrupt_note)
+                def run_prep_step(cmd):
+                    # A heavy source's worth of data still has to be read
+                    # all the way through for either pass below (the flat
+                    # remux to build a real moov, the audio pass to
+                    # transcode it) even though the video itself is only
+                    # ever stream-copied, never re-encoded -- a plain
+                    # subprocess.run here reported nothing until the whole
+                    # pass finished, which is exactly what the CRC-check
+                    # extraction step above already got fixed for: the
+                    # percentage raced to 100% and the window then sat
+                    # there with no feedback while this ran. Same
+                    # -progress pipe:1 / frame= parsing as _save_video's
+                    # remux fix, tracked against the video's own known
+                    # frame count (confirmed by direct testing: FFmpeg
+                    # reports frame= progress even for a pure -c copy
+                    # pass, since it's counting packets, not decoding).
+                    try:
+                        proc = subprocess.Popen(
+                            [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                             "-progress", "pipe:1", *cmd],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True, encoding="utf-8", errors="replace", bufsize=1)
+                    except OSError:
+                        return False
+                    for line in proc.stdout:
+                        if stop_event.is_set():
+                            proc.terminate()
+                            break
+                        line = line.strip()
+                        if line.startswith("frame=") and total_frames:
+                            try:
+                                pct = min(100, int(int(line.split("=", 1)[1]) * 100 / total_frames))
+                                self.q.put(("status", f"preparing playback... {pct}%"))
+                            except ValueError:
+                                pass
+                    return proc.wait() == 0
+
+                self.q.put(("status", "preparing playback..."))
+                flat_path = os.path.join(tmp_dir, "video_flat.mp4")
+                if run_prep_step(["-i", blob_path, "-c", "copy", flat_path]) \
+                        and os.path.exists(flat_path):
+                    play_path = flat_path
+
+                if stop_event.is_set():
+                    return
+                aac_path = os.path.join(tmp_dir, "video_playback.mp4")
+                if run_prep_step(["-i", blob_path, "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                                   aac_path]) and os.path.exists(aac_path):
+                    play_path = aac_path
+
+            if stop_event.is_set():
+                return
+            # Handed off to the system's default player: a real separate
+            # window with real hardware decode, real audio, and a real seek
+            # bar -- FMFF's own in-window loop (_load_video) is silent and
+            # renders into this same window's canvas, which is worse on both
+            # counts, not just a stylistic difference. Falls back to that
+            # in-window loop only if launching the default player fails
+            # outright (e.g. nothing associated with .mp4 at all).
+            degraded_note = "" if play_path is not blob_path else \
+                " -- no ffmpeg found, so the seek bar/duration may not work right"
+            self.q.put(("status", f"playing in the system's default player{corrupt_note}{degraded_note}"))
+            try:
+                _open_with_default_player(play_path)
+                return
+            except OSError as exc:
+                self.q.put(("fmff_video_fallback", (blob_path, corrupt_note, str(exc))))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _load_fmff_audio(self, d):
         """An .fmff audio file (see FMFFEncoder.encode_audio): show its
@@ -4802,34 +4982,54 @@ class MediaViewer:
         a container swap) before being handed off, which is the file
         that actually gets played."""
         self._blit_pil(d.thumbnail())
+        self.set_status("extracting... 0%")
 
-        tmp_dir = tempfile.mkdtemp(prefix="fmff_view_")
-        blob_path = os.path.join(tmp_dir, "audio.mp4")
-        try:
-            d.extract_media(blob_path)
-        except ValueError as exc:
-            self.set_status(str(exc))
-            return
-        corrupt_note = (f", {d.last_corrupt_segments} of {d.segment_count} segment(s) "
-                         f"corrupt/missing -- skipped" if d.last_corrupt_segments else "")
+        stop_event = threading.Event()
+        self.stop_event = stop_event
 
-        play_path = blob_path
-        ffmpeg = _find_ffmpeg()
-        if ffmpeg is not None:
-            opus_path = os.path.join(tmp_dir, "audio.opus")
-            result = subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                                      "-i", blob_path, "-c:a", "copy", opus_path],
-                                     check=False, stderr=subprocess.DEVNULL)
-            if result.returncode == 0 and os.path.exists(opus_path):
-                play_path = opus_path
+        def report(done, total):
+            if not stop_event.is_set() and total:
+                self.q.put(("status", f"extracting... {done * 100 // total}%"))
 
-        self.set_status(f"playing in the system's default player "
-                         f"({d.duration_ms / 1000:.1f}s, {d.sample_rate} Hz, "
-                         f"{d.channels}ch{corrupt_note})")
-        try:
-            _open_with_default_player(play_path)
-        except OSError as exc:
-            self.set_status(f"couldn't launch default player: {exc}")
+        def worker():
+            # extract_media + the ffmpeg remux below used to run right here
+            # on the GUI thread with no progress shown -- fine for a short
+            # clip, but a heavy/long audio file could visibly freeze the
+            # window ("Not Responding") the same way an unbackgrounded
+            # video load could (see _load_fmff_video's identical fix).
+            tmp_dir = tempfile.mkdtemp(prefix="fmff_view_")
+            blob_path = os.path.join(tmp_dir, "audio.mp4")
+            try:
+                d.extract_media(blob_path, progress_cb=report)
+            except ValueError as exc:
+                self.q.put(("status", str(exc)))
+                return
+            if stop_event.is_set():
+                return
+            corrupt_note = (f", {d.last_corrupt_segments} of {d.segment_count} segment(s) "
+                             f"corrupt/missing -- skipped" if d.last_corrupt_segments else "")
+
+            play_path = blob_path
+            ffmpeg = _find_ffmpeg()
+            if ffmpeg is not None:
+                opus_path = os.path.join(tmp_dir, "audio.opus")
+                result = subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                                          "-i", blob_path, "-c:a", "copy", opus_path],
+                                         check=False, stderr=subprocess.DEVNULL)
+                if result.returncode == 0 and os.path.exists(opus_path):
+                    play_path = opus_path
+
+            if stop_event.is_set():
+                return
+            self.q.put(("status", f"playing in the system's default player "
+                                   f"({d.duration_ms / 1000:.1f}s, {d.sample_rate} Hz, "
+                                   f"{d.channels}ch{corrupt_note})"))
+            try:
+                _open_with_default_player(play_path)
+            except OSError as exc:
+                self.q.put(("status", f"couldn't launch default player: {exc}"))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _load_audio_file(self, path):
         """Open a plain (non-.fmff) audio file the same way _load_video_file
@@ -4854,16 +5054,24 @@ class MediaViewer:
         multi-frame preview. Runs off the GUI thread: rendering a many-
         page PDF is slow enough to visibly freeze the window otherwise,
         the same reasoning every other loader here backs its decode with
-        a background thread for."""
-        self._blit_pil(self._placeholder_image(f"rendering pages...\n{Path(path).name}"))
-        self.set_status("rendering pages...")
+        a background thread for. Status text matches the same "decoding...
+        N%" wording opening/converting a .fmff already uses (see
+        _load_fmff_image/on_save) instead of a plain, un-quantified
+        "rendering pages..." -- one consistent way of showing progress
+        everywhere in the viewer, not a document-specific phrasing."""
+        self._blit_pil(self._placeholder_image(f"decoding...\n{Path(path).name}"))
+        self.set_status("decoding...")
 
         stop_event = threading.Event()
         self.stop_event = stop_event
 
+        def on_progress(done, total):
+            if not stop_event.is_set() and total:
+                self.q.put(("status", f"decoding... {done * 100 // total}%"))
+
         def worker():
             try:
-                pages = _render_document_pages(path)
+                pages = _render_document_pages(path, progress_cb=on_progress)
             except Exception as exc:
                 if not stop_event.is_set():
                     self.q.put(("status", f"failed to render {Path(path).name}: {exc}"))
@@ -5211,6 +5419,62 @@ class MediaViewer:
 
         threading.Thread(target=work, daemon=True).start()
 
+    # -- versions --------------------------------------------------------
+
+    def on_add_version(self):
+        """Append a new named version to the currently open still-image
+        .fmff, in place -- the GUI counterpart of the CLI's add-version
+        (see FMFFEncoder.add_version), which was previously the only way
+        to reach this at all. Picks the new version's own source image
+        from disk (it must match the open file's width/height exactly --
+        add_version enforces that itself), then re-decodes and switches
+        the view to the version just added so there's visible
+        confirmation it actually landed, the same way picking one from
+        the version dropdown already does."""
+        if not self.current_is_fmff or not self.current_source_path:
+            self.set_status("add version needs a still-image .fmff open first")
+            return
+        if self.current_is_video or self.current_is_audio or self.current_is_document:
+            self.set_status("add version only works on a still-image .fmff "
+                             "(not video/audio/a document)")
+            return
+        if self._anim_frames is not None and len(self._anim_frames) > 1:
+            self.set_status("add version doesn't support an already-animated .fmff")
+            return
+
+        fmff_path = self.current_source_path
+        input_path = filedialog.askopenfilename(
+            title="New version's image (must match this file's own size)",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp *.tiff *.tif"),
+                       ("All files", "*.*")])
+        if not input_path:
+            return
+        name = simpledialog.askstring("Version name", "Name for this version (optional):",
+                                       parent=self.root)
+        note = simpledialog.askstring("Version note", "Note for this version (optional):",
+                                       parent=self.root)
+
+        self._cancel_background()
+        self.q.put(("busy", (None, "Adding version")))
+
+        def work():
+            try:
+                src_size = os.path.getsize(fmff_path)
+                result = FMFFEncoder().add_version(fmff_path, input_path,
+                                                     name=name or None, note=note or None)
+                new_size = os.path.getsize(fmff_path)
+                self.q.put(("busy_done", None))
+                self.q.put(("status", f"added version {result['version_index']} "
+                                       f"({result['name']!r}) to {fmff_path}  "
+                                       f"({_fmt_size(src_size)} -> {_fmt_size(new_size)}, "
+                                       f"{_fmt_saving(src_size, new_size)})"))
+                self.q.put(("add_version_done", (fmff_path, result["version_index"])))
+            except Exception as exc:
+                self.q.put(("busy_done", None))
+                self.q.put(("status", f"failed to add version: {exc}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
 
 def _save_video(source_path, is_fmff, fps, path, dest_ext, progress_cb):
     """Save a whole video (not just one displayed frame) either as .fmff or
@@ -5252,9 +5516,31 @@ def _save_video(source_path, is_fmff, fps, path, dest_ext, progress_cb):
                 # format is used at all.
                 audio_args = ["-c", "copy", "-c:a", "aac", "-b:a", "192k"] \
                     if dest_ext in (".mp4", ".mov", ".m4v") else ["-c", "copy"]
-                subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                                 "-i", blob_path, "-map", "0", *audio_args,
-                                 *_ffmpeg_metadata_args(dec.tags), path], check=True)
+                # -progress pipe:1 (parsed the same way _encode_fragmented_av1
+                # does) instead of a plain blocking subprocess.run -- without
+                # it the busy overlay had nothing to report until the whole
+                # remux finished, so a heavy file just sat at "0%" the entire
+                # time and then jumped straight to 100%, which reads as
+                # frozen/broken even though it wasn't.
+                total = dec.frame_count or None
+                proc = subprocess.Popen(
+                    [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-progress", "pipe:1",
+                     "-i", blob_path, "-map", "0", *audio_args,
+                     *_ffmpeg_metadata_args(dec.tags), path],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, encoding="utf-8", errors="replace", bufsize=1)
+                stderr_lines = _start_stderr_collector(proc)
+                for line in proc.stdout:
+                    line = line.strip()
+                    if line.startswith("frame=") and total:
+                        try:
+                            progress_cb(min(100, int(int(line.split("=", 1)[1]) * 100 / total)))
+                        except ValueError:
+                            pass
+                ret = proc.wait()
+                if ret != 0 or not os.path.exists(path):
+                    raise RuntimeError(f"ffmpeg failed to save video (exit code {ret})"
+                                        f"{_ffmpeg_failure_detail(stderr_lines)}")
             progress_cb(100)
         else:
             shutil.copyfile(source_path, path)

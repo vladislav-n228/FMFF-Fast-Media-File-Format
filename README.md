@@ -359,7 +359,13 @@ that didn't need re-storing.
   nearest checkpoint) -- **104 tiles touched instead of 120**, a gap
   that only widens as a chain gets longer. The cost is one full version's
   worth of extra storage every 8 versions, not every version.
-- CLI only for now -- the viewer doesn't have a version switcher yet.
+- The viewer isn't CLI-only for this any more: a toolbar dropdown lists
+  every version of the open file and switches the displayed image to
+  whichever one is picked, and an **Add version...** button appends a new
+  one (pick the new version's image, optionally name/note it) without
+  leaving the GUI -- both just call the same `add-version`/`list_versions`
+  the CLI already used. `add-mask` (see "Selection masks" below) is still
+  CLI-only.
 
 ```
 python F.M.F.F.py encode photo.png photo.fmff --version-name original --version-note "as shot"
@@ -536,6 +542,25 @@ the AAC transcode succeeding; if that transcode fails for any reason,
 the seek bar still works even though the file falls back to Opus
 audio.
 
+`extract_media()` plus these two remux/transcode passes used to run
+right on the GUI thread, with nothing shown while they worked -- fine
+for a short clip, but for a genuinely heavy video this was confirmed to
+freeze the window long enough for Windows to flag it "Not Responding",
+with no percentage or other feedback the whole time. All of it now runs
+in a background thread instead: reading/CRC-checking each segment
+reports real `extracting... N%` progress against the segment count,
+and the two playback-prep passes report real `preparing playback... N%`
+by parsing FFmpeg's own `-progress pipe:1` output against the video's
+known frame count (confirmed by direct testing that FFmpeg reports
+`frame=` progress even for a pure `-c copy` pass, since it's counting
+packets, not decoding) -- the GUI thread itself is never blocked on
+anything video-sized. The same fix applies to opening a `.fmff`
+image (the thumbnail-to-full-resolution upscale that used to run before
+the tile-decode thread even started could itself stall a large image)
+and to browsing a PDF/`.txt` (see "Documents" below), which now shows
+the same `decoding... N%` wording instead of a plain, unquantified
+"rendering pages...".
+
 Saving a video `.fmff` back out via Save as... / `decode`, not just
 playing it live, hit the identical Opus-in-MP4 problem on the *export*
 side: both used to stream-copy the audio track untouched into whatever
@@ -548,13 +573,23 @@ extensions now force the audio through an AAC transcode on export too
 (the video itself stays a stream copy either way, so this doesn't add
 real encode time), the same fix live playback already gets above.
 
+Save as... on a `.fmff` video to another video container had a matching
+progress-display bug: that remux ran as one blocking call with nothing
+parsed from it, so the busy overlay sat at a static "0%" for the whole
+export, however long it took, then jumped straight to 100% -- easy to
+mistake for a frozen/broken export on a heavy file even though nothing
+was actually wrong. This export path now gets the same real `-progress
+pipe:1` frame-count tracking described above instead.
+
 ### Subtitles
 
-A text-based subtitle track (SRT, ASS/SSA, WebVTT, or already-mov_text)
-present in the source rides along in the exact same fragmented MP4 as
-the AV1 video and Opus audio, converted to MP4's own `mov_text` timed-
-text format. This needed no new header fields, no second segment table,
-nothing like video alpha's separate track below -- subtitles are just
+Every text-based subtitle track (SRT, ASS/SSA, WebVTT, or already-
+mov_text) present in the source -- not just the first one, each is
+mapped explicitly by its own stream index -- rides along in the exact
+same fragmented MP4 as the AV1 video and Opus audio, converted to MP4's
+own `mov_text` timed-text format. This needed no new header fields, no
+second segment table, nothing like video alpha's separate track below
+-- subtitles are just
 more bytes inside the one blob `extract_media()` already hands back
 whole, so a decoded `.fmff` video with subtitles plays them back in any
 player that reads `mov_text` (which is to say: any of them) with zero
@@ -904,10 +939,10 @@ This is a personal/hobby project, not a production tool:
 
 - Images: 8-bit RGB/RGBA only. Header fields for bit depth / color space
   are reserved for a future HDR extension but not implemented.
-- Images: versions (see "Versions" above) are still-image-only, CLI-only
-  (no viewer switcher yet), and share one quality setting across every
-  version in a file -- `add-version` always uses the file's own already-
-  stored quality, never a per-version override.
+- Images: versions (see "Versions" above) are still-image-only and share
+  one quality setting across every version in a file -- `add-version`
+  (CLI, or the viewer's own **Add version...** button) always uses the
+  file's own already-stored quality, never a per-version override.
 - Images: selection masks (see "Selection masks" above) are one mask per
   version, CLI-only, same still-image-only scope as versions.
 - Images: encoding is pure Python per-tile -- spread across CPU cores for
@@ -940,14 +975,16 @@ This is a personal/hobby project, not a production tool:
   through another lossy codec would be, even from an already-lossy
   source like MP3 (there's no coefficient-passthrough trick for audio
   the way JPEG images get one).
-- Subtitles: only a text-based track is carried over (see "Subtitles"
+- Subtitles: only text-based tracks are carried over (see "Subtitles"
   above) -- an image-based one (PGS/DVD subs) is silently left out of
-  the encode rather than attempted and failed. Only one subtitle track
-  survives even when the source has several (FFmpeg's own default
-  stream selection picks one, the same way it already does for audio),
-  and styling beyond plain text is only as faithful as `mov_text`
-  itself supports (fairly little -- MP4's timed-text format is much
-  simpler than ASS/SSA's own).
+  the encode rather than attempted and failed. Every text-based subtitle
+  track survives when the source has several, not just one (every stream
+  is mapped explicitly by its own index rather than relying on FFmpeg's
+  "best of each type" auto-selection -- the same explicit-mapping fix
+  that also means every audio track survives, not just one), and styling
+  beyond plain text is only as faithful as `mov_text` itself supports
+  (fairly little -- MP4's timed-text format is much simpler than
+  ASS/SSA's own).
 - Documents: PDF and `.txt` only -- Office formats (`.docx`/`.xlsx`/...)
   would need an external renderer (LibreOffice) not implemented here. The
   document itself is stored byte-for-byte (see "Documents" above), so
@@ -1027,6 +1064,13 @@ scenario, not as core format features:
   GIF/WebP) and hands the result to the system's default player --
   headless, no FMFF GUI window at all. `--choose` shows Windows' native
   "Open with" picker instead of silently using the remembered default.
+  The GUI viewer has the same option too, without going headless: an
+  **Open externally** toolbar button converts whatever's currently
+  loaded the same way and hands it to the OS default app, while the
+  viewer window itself stays open. Useful for any content type, but
+  especially a PDF/`.txt`, since the viewer's own page preview has no
+  text layer, search, or hyperlinks (see "Documents" above) the way a
+  real document viewer does.
 - **`register-filetype [--mode external|viewer]`** -- registers `.fmff`
   as a real Windows file type for the current user only (`HKEY_CURRENT_
   USER\Software\Classes`, no admin rights, nothing outside this one
